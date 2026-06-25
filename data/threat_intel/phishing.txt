@@ -1,0 +1,34 @@
+Phishing is a cyberattack technique in which attackers impersonate trusted entities to steal sensitive information.
+
+Common phishing techniques:
+- email spoofing
+- fake login pages
+- credential harvesting
+- malicious links
+- fake attachments
+- spear phishing
+- business email compromise (BEC)
+
+Common indicators:
+- suspicious URLs
+- urgent language
+- fake domains
+- spelling mistakes
+- unexpected attachments
+
+MITRE ATT&CK Techniques:
+- T1566: Phishing
+- T1598: Phishing for Information
+
+Mitigation:
+- employee awareness training
+- email filtering
+- multi-factor authentication
+- URL inspection
+- anti-phishing gateways
+
+Targets:
+- banking users
+- enterprises
+- cloud platforms
+- government organizations

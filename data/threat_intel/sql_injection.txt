@@ -1,0 +1,22 @@
+SQL Injection is a web application attack where malicious SQL queries are inserted into input fields to manipulate databases.
+
+Attackers exploit insecure input validation to:
+- access sensitive data
+- bypass authentication
+- modify databases
+- delete records
+
+Common indicators:
+- unusual SQL queries
+- database errors
+- unauthorized data access
+
+MITRE ATT&CK Technique:
+- T1190: Exploit Public-Facing Application
+
+Mitigation strategies:
+- parameterized queries
+- prepared statements
+- input validation
+- least privilege database access
+- web application firewalls

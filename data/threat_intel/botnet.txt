@@ -1,0 +1,22 @@
+A botnet is a network of compromised devices controlled remotely by attackers.
+
+Botnets are commonly used for:
+- DDoS attacks
+- spam campaigns
+- credential stuffing
+- malware distribution
+
+Common indicators:
+- unusual outbound traffic
+- communication with command-and-control servers
+- coordinated malicious activity
+
+MITRE ATT&CK Technique:
+- T1584: Compromise Infrastructure
+
+Mitigation strategies:
+- network monitoring
+- endpoint detection
+- firewall rules
+- device patching
+- threat intelligence feeds

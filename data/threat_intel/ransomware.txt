@@ -1,0 +1,23 @@
+Ransomware is malware that encrypts victim files and demands payment for decryption.
+
+Attackers commonly spread ransomware through:
+- phishing emails
+- malicious downloads
+- exploit kits
+- remote desktop attacks
+
+Common indicators:
+- encrypted files
+- ransom notes
+- blocked access
+- unusual encryption activity
+
+MITRE ATT&CK Technique:
+- T1486: Data Encrypted for Impact
+
+Mitigation strategies:
+- regular backups
+- endpoint protection
+- network segmentation
+- patch management
+- least privilege access

@@ -1,0 +1,25 @@
+A Distributed Denial of Service (DDoS) attack is a cyberattack in which multiple compromised systems flood a target server, network, or service with traffic.
+
+The goal is to exhaust resources and make the service unavailable to legitimate users.
+
+Common indicators:
+- Extremely high traffic volume
+- Large number of requests from multiple IPs
+- Network congestion
+- Service slowdown or outage
+
+MITRE ATT&CK Technique:
+- T1498: Network Denial of Service
+
+Common mitigation strategies:
+- Rate limiting
+- Traffic filtering
+- Web Application Firewall (WAF)
+- Load balancing
+- Intrusion Detection Systems (IDS)
+
+DDoS attacks are commonly used against:
+- websites
+- cloud infrastructure
+- gaming servers
+- financial systems

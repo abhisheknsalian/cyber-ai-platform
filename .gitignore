@@ -1,0 +1,27 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Vector databases
+rag/chroma_db/
+rag/multi_threat_db/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large model/cache files
+*.bin
+*.pt
+*.pth
+
+# VS Code settings (optional)
+.vscode/
+
+data/raw/
