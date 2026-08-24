@@ -1,5 +1,6 @@
-"""Points the RAG config at an isolated, temporary Chroma collection before any
-`backend.*` module is imported, so tests never touch the real rag/chroma_db/.
+"""Points RAG + ML config at isolated, temporary locations before any `backend.*`
+module is imported, so tests never touch rag/chroma_db/, models/, or require the
+real 225k-row CICIDS2017 dataset.
 """
 
 import os
@@ -11,9 +12,45 @@ _TEST_CHROMA_DIR = Path(tempfile.mkdtemp(prefix="cyber_ai_test_chroma_"))
 os.environ["CHROMA_PERSIST_DIR"] = str(_TEST_CHROMA_DIR)
 os.environ["CHROMA_COLLECTION"] = "test_threat_intel"
 
+_TEST_ML_DIR = Path(tempfile.mkdtemp(prefix="cyber_ai_test_ml_"))
+_TEST_DATASET_PATH = _TEST_ML_DIR / "synthetic_traffic.csv"
+os.environ["DDOS_DATASET_PATH"] = str(_TEST_DATASET_PATH)
+os.environ["ML_MODEL_DIR"] = str(_TEST_ML_DIR / "models")
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 
+from backend.ml.config import FEATURE_COLUMNS  # noqa: E402
+from backend.ml.train import train as train_model  # noqa: E402
 from backend.rag.ingestion import build_vector_store  # noqa: E402
+
+
+def _build_synthetic_dataset(path: Path, rows: int = 240, seed: int = 42) -> None:
+    """A small, clearly-synthetic dataset using the real CICIDS2017 column names, used
+    only to exercise the ML pipeline's plumbing (loading, cleaning, training,
+    inference). It is NOT representative real traffic and its accuracy is meaningless
+    -- real evaluation requires the actual CICIDS2017 file (see README).
+    """
+    rng = np.random.default_rng(seed)
+    half = rows // 2
+
+    df = pd.DataFrame({column: rng.exponential(scale=1000, size=rows) for column in FEATURE_COLUMNS})
+    df["Label"] = ["BENIGN"] * half + ["DDoS"] * (rows - half)
+    # Give DDoS rows a mild, learnable signal so the classifier beats chance --
+    # tests only assert "valid prediction", never a specific accuracy number.
+    df.loc[df["Label"] == "DDoS", "Flow Duration"] += 5000
+
+    # Inject exact duplicate rows (including across the BENIGN/DDoS split) to
+    # exercise the deduplication fix in preprocessing.load_and_clean_dataset.
+    duplicates = df.sample(n=10, random_state=seed)
+    df = pd.concat([df, duplicates], ignore_index=True)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+
+
+_build_synthetic_dataset(_TEST_DATASET_PATH)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -21,3 +58,10 @@ def _test_vector_store():
     build_vector_store()
     yield
     shutil.rmtree(_TEST_CHROMA_DIR, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _test_ml_model():
+    train_model()
+    yield
+    shutil.rmtree(_TEST_ML_DIR, ignore_errors=True)

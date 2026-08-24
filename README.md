@@ -4,18 +4,25 @@ A local, retrieval-augmented cybersecurity threat-intelligence analysis platform
 dashboard backed by a FastAPI service. The backend embeds a small knowledge base of threat
 write-ups (`data/threat_intel/*.txt`) into a Chroma vector store and uses a locally-running
 Llama 3.2 model (via [Ollama](https://ollama.com)) to turn a natural-language question into a
-**validated, structured JSON threat analysis** with source attribution.
+**validated, structured JSON threat analysis** with source attribution. A separate Random
+Forest classifier (trained offline on CICIDS2017-style network flow data) can also score a
+traffic sample as BENIGN/DDoS and feed that prediction into the same RAG pipeline. See
+**ML Detection Pipeline** below.
 
 ## Architecture
 
 ```text
 React dashboard (Vite + TypeScript + Tailwind)
-   → FastAPI (POST /analyze, GET /health, GET /threats)
+   → FastAPI (POST /analyze, GET /health, GET /threats, POST /classify, POST /analyze/classification)
    → relevance-filtered retrieval (ChromaDB + HuggingFace embeddings)
    → deterministic threat-type identification + MITRE ATT&CK extraction (from source docs)
    → structured LLM generation (Ollama / Llama 3.2, JSON-schema constrained)
    → validated Pydantic response with source attribution
    → React
+
+Network Traffic Features (CICFlowMeter-style)
+   → Random Forest (backend/ml/) → BENIGN / DDoS prediction
+   → same threat-identification + RAG + LLM pipeline above → structured threat report
 ```
 
 Out-of-domain or unsupported queries never reach the LLM at all: if nothing in the knowledge
@@ -36,11 +43,14 @@ retrieval layer. See **Relevance Filtering** below.
 ```bash
 uv sync
 uv run python -m backend.rag.ingestion   # build the vector store (see below)
+uv run python -m backend.ml.train         # optional: train the DDoS classifier (see below)
 uv run uvicorn backend.main:app --reload
 ```
 
 `uv sync` installs FastAPI, LangChain, ChromaDB, sentence-transformers, the Ollama client,
-pytest, and the existing notebook/ML dependencies into a local `.venv`.
+scikit-learn, joblib, pytest, and the existing notebook/ML dependencies into a local `.venv`.
+The classifier training step is optional -- `/analyze`, `/health`, and `/threats` all work
+without it; only `/classify` and `/analyze/classification` need a trained model.
 
 ### Frontend
 
@@ -89,6 +99,9 @@ accumulates stale or duplicate chunks.
 - `GET /health` — API/vector-store/LLM status (does not run LLM inference — see below)
 - `GET /threats` — threat categories discovered from `data/threat_intel/*.txt`, for the frontend
 - `POST /analyze` — structured, retrieval-grounded threat analysis
+- `POST /classify` — DDoS/BENIGN network-traffic classification (Random Forest); see **ML Detection Pipeline**
+- `GET /ml/feature-importance` — the trained model's own `feature_importances_`, ranked
+- `POST /analyze/classification` — takes an already-computed classifier prediction and runs it through the same RAG pipeline as `/analyze`
 - `GET /docs` — interactive Swagger UI
 
 `GET /health` response:
@@ -226,6 +239,119 @@ significantly.
   database** — techniques not present in these five files (including sub-techniques, tactics, or
   related groups/software) simply won't appear, no matter what's asked.
 
+## ML Detection Pipeline
+
+**The classifier is trained on CICIDS2017-style network traffic and currently detects DDoS vs
+BENIGN traffic. It is not a general-purpose malware detector or a real-time network monitoring
+system.** `POST /classify` scores one already-extracted CICFlowMeter feature vector offline —
+there is no packet capture, no live traffic ingestion, and no fabricated "live" dashboard.
+
+```text
+CICIDS2017 CSV (Friday-Afternoon-DDoS capture)
+   → preprocessing (backend/ml/preprocessing.py): strip columns, drop inf/NaN, drop duplicates
+   → train/test split (stratified, random_state=42)
+   → RandomForestClassifier(n_estimators=100, random_state=42)
+   → saved to models/ddos_random_forest.joblib (gitignored)
+
+At inference:
+NetworkTrafficFeatures (validated Pydantic request)
+   → backend/ml/predictor.py: load saved model, predict + predict_proba
+   → ClassificationResult (prediction, probability, model)
+   → optionally: backend/services/classification.py maps DDoS → the same RAG query used by
+     the Threat Analysis page → ThreatAnalysis (identical shape to /analyze's response)
+```
+
+### Getting the dataset
+
+The CICIDS2017 "Friday-Afternoon-DDoS" CSV (~225k rows, 79 columns) is **not committed to this
+repo** and is not downloadable via a plain public URL — CIC now gates it behind a registration
+form at cicresearch.ca (name/email/organization). Register there yourself, download
+`Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv`, and place it at:
+
+```text
+data/raw/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv
+```
+
+(or point `DDOS_DATASET_PATH` at wherever you saved it).
+
+### Training
+
+```bash
+uv run python -m backend.ml.train
+```
+
+Prints class distribution, a full classification report (including DDoS-specific
+precision/recall/F1), and the confusion matrix, then saves the model to
+`models/ddos_random_forest.joblib` and a metrics/metadata JSON alongside it. `models/` is
+gitignored — the artifact is never committed. Training and inference are fully separate: the
+API only ever loads the saved `.joblib` file (`backend/ml/predictor.py`); it never fits a model.
+
+### Data leakage audit and fix
+
+The original notebook (`notebooks/01_data_exploration.ipynb`) reported 99.99% accuracy / 1.00
+precision-recall-F1 across the board. That result should not be trusted at face value. Auditing
+the notebook's code found:
+
+- No leakage from preprocessing-before-split in the classic sense (no scaler or encoder was fit
+  on the full dataset before splitting).
+- **No `drop_duplicates()` call anywhere before `train_test_split`.** CICIDS2017 -- and this
+  specific Friday-Afternoon-DDoS capture -- is documented in ML-security literature (e.g.
+  Engelen, Rimmer & Joosen, *"Troubleshooting an IDS Dataset: the CICIDS2017 Case Study"*, 2021)
+  to contain large numbers of duplicate/near-duplicate flow records. Combined with a plain random
+  80/20 split, duplicate rows can land in both train and test, letting the model "recognize" a
+  test row it already memorized during training -- the textbook explanation for suspiciously
+  perfect metrics on this exact dataset.
+- `train_test_split` also didn't use `stratify=y` (minor; classes were already fairly balanced).
+
+**Fix applied** in `backend/ml/preprocessing.py::load_and_clean_dataset`: deduplicate the full
+cleaned dataset before the split (and log how many rows were removed), and stratify the split.
+The model architecture and hyperparameters are unchanged (`RandomForestClassifier(n_estimators=100,
+random_state=42)`), per Phase 4 scope -- only the leakage is fixed, not the model.
+
+**Honest metrics from this fix have not been produced yet.** The real 225k-row dataset was not
+available in this environment (see below), so real retraining hasn't run. Do not treat any
+number printed by a training run against a placeholder/synthetic dataset as a real evaluation
+result -- see **Known Limitations**.
+
+### Feature schema and validation
+
+`backend/ml/config.py::FEATURE_COLUMNS` is the single source of truth for the 78 trained feature
+names (in training order) -- both `backend/ml/schemas.py`'s Pydantic request model and
+`frontend/src/types/ml.ts` are generated from (or kept in lockstep with) this same list, so the
+request schema can never silently drift from what the model was actually trained on. Every field
+is required, extra fields are rejected (`extra="forbid"`), and NaN/Infinity/non-numeric values
+are rejected with a validation error -- untrusted traffic input is never passed straight to the
+model.
+
+### Explainability
+
+`GET /ml/feature-importance` returns the trained model's own `feature_importances_`, ranked --
+nothing is invented or hand-labeled.
+
+### Classifier + RAG integration
+
+`POST /analyze/classification` takes an already-computed prediction (e.g. from `/classify`), not
+raw features:
+
+```json
+// request
+{ "prediction": "DDoS", "probability": 0.98 }
+```
+
+```json
+// response
+{
+  "classification": { "prediction": "DDoS", "probability": 0.98, "model": "random_forest", "classification": "malicious" },
+  "analysis": {
+    "threat": "ddos_attack", "severity": "High", "mitre_attack": [{ "id": "T1498", "name": "Network Denial of Service" }],
+    "indicators": [...], "mitigations": [...], "sources": [...]
+  }
+}
+```
+
+`BENIGN` is a valid, expected prediction -- it returns `"analysis": null` rather than fabricating
+a threat report for non-malicious traffic; the LLM is never called in that case.
+
 ## Frontend
 
 `frontend/` is a React + TypeScript dashboard built with Vite and styled with Tailwind CSS —
@@ -240,15 +366,21 @@ hand-built with Tailwind.
   technique links to its real `attack.mitre.org` page), mitigations, and sources with relevance
   scores. A `no_relevant_intelligence` response renders as a distinct empty state, never a
   fabricated report.
+- **Network Detection** (`/detection`) — paste a CICFlowMeter-style JSON feature vector (or use
+  "Fill example shape" for an all-zero shape reference, not real traffic), classify it, then
+  optionally "Analyze Threat" to run the resulting prediction through the same RAG pipeline and
+  render it with the same `AnalysisResult` component as the Threat Analysis page. A `BENIGN`
+  result renders a distinct "no threat detected" state instead of a fabricated report.
 - **Threat Intelligence** (`/intelligence`) — the threat categories from `GET /threats`, i.e.
   exactly what's in `data/threat_intel/`.
 - **About** (`/about`) — architecture explanation; states plainly what is and isn't implemented.
 
 **API integration**: `frontend/src/services/api.ts` is the only place that calls `fetch`;
-`analyzeThreat`/`getHealth`/`getThreats` are typed against `frontend/src/types/api.ts`, which
-mirrors `backend/models/schemas.py` field-for-field. Requests time out after 60s. Every failure
-mode (backend unreachable, timeout, non-2xx, malformed JSON) is normalized into a single
-`ApiError` with a user-facing message — no raw errors or stack traces reach the UI.
+`analyzeThreat`/`getHealth`/`getThreats`/`classifyTraffic`/`getFeatureImportance`/`analyzeClassification`
+are typed against `frontend/src/types/api.ts` and `frontend/src/types/ml.ts`, which mirror the
+backend Pydantic models field-for-field. Requests time out after 60s. Every failure mode (backend
+unreachable, timeout, non-2xx, malformed JSON, structured validation errors) is normalized into a
+single `ApiError` with a user-facing message — no raw errors or stack traces reach the UI.
 
 **Configuration**: the backend URL is read from `VITE_API_URL` (see `frontend/.env.example`),
 defaulting to `http://localhost:8000` if unset. Never commit `frontend/.env`.
@@ -271,6 +403,8 @@ All settings have sane local defaults and can be overridden with environment var
 | `CHUNK_OVERLAP` | `50` | Chunk overlap (characters) used during ingestion |
 | `RAG_TOP_K` | `5` | Candidate chunks retrieved before relevance filtering |
 | `RAG_SCORE_THRESHOLD` | `1.5` | Max distance score to be considered relevant (lower = more similar) |
+| `DDOS_DATASET_PATH` | `data/raw/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv` | CICIDS2017 CSV used by `backend.ml.train` |
+| `ML_MODEL_DIR` | `models` | Where the trained classifier artifact + metadata are saved/loaded |
 
 ## Testing
 
@@ -283,6 +417,11 @@ Tests use an isolated, temporary Chroma collection (built fresh each test sessio
 tests, so the suite does **not** require Ollama to be running. Retrieval tests do use the real
 embedding model (no network calls — it's cached locally after the first run).
 
+The ML tests likewise never touch `data/raw/` or `models/`: `tests/conftest.py` generates a
+small, clearly-synthetic CICIDS-shaped CSV (with a few intentional duplicate rows) and trains a
+real — if not meaningful — model artifact against it in an isolated temp directory, purely to
+exercise the pipeline's plumbing. **No test result from this fixture is a real accuracy claim.**
+
 Covered:
 - Retrieval returns the correct document for each of the 5 threat types
 - An off-topic query returns no relevant chunks
@@ -290,30 +429,43 @@ Covered:
 - Empty, whitespace-only, and over-length queries return `422`
 - An off-topic query returns `no_relevant_intelligence` **without calling the LLM**
 - Vector-store-unavailable, LLM-unavailable, and malformed-LLM-output all return a clean error response instead of crashing
+- The classifier model loads, predicts, returns a valid probability, and exposes feature importance
+- The synthetic fixture's intentional duplicate rows are removed by `load_and_clean_dataset` (leakage-fix regression test)
+- `/classify` handles a valid request, a missing feature, an invalid feature type, an unexpected extra field, and a not-yet-trained model
+- `/analyze/classification` maps `DDoS` → a `ddos_attack` RAG analysis, maps `BENIGN` → `analysis: null` **without calling the LLM**, and rejects an unsupported prediction
 
 ## Project Structure
 
 ```text
 backend/
-    main.py               # FastAPI app: /, /health, /threats, /analyze
+    main.py               # FastAPI app: /, /health, /threats, /analyze, /classify, /ml/*, /analyze/classification
     models/
-        schemas.py         # Pydantic request/response models
+        schemas.py         # Pydantic request/response models (RAG)
     rag/
         config.py           # paths + env-driven settings
         embeddings.py        # embedding model loader (cached)
         ingestion.py          # builds/rebuilds the Chroma store from data/threat_intel/
         retrieval.py           # loads the store, relevance-filtered similarity search
+    ml/
+        config.py            # FEATURE_COLUMNS (single source of truth), paths, hyperparameters
+        preprocessing.py      # cleaning shared by train.py and predictor.py
+        schemas.py             # dynamically-generated NetworkTrafficFeatures + classification schemas
+        train.py                # uv run python -m backend.ml.train -- the only place the model is fit
+        predictor.py             # loads the saved model; predict() + feature_importance()
     services/
         llm.py               # Ollama call + structured JSON-schema output + parsing
         llm_status.py         # lightweight Ollama reachability check for /health
         knowledge_base.py     # discovers threat categories for /threats
         threat_analysis.py    # orchestrates retrieval -> MITRE extraction -> LLM -> response
+        classification.py     # maps a classifier prediction -> the RAG pipeline above
 data/threat_intel/         # source threat-intelligence documents
+data/raw/                   # CICIDS2017 CSV goes here (gitignored, not committed)
+models/                      # trained classifier artifact + metadata (gitignored, not committed)
 notebooks/                 # exploratory notebooks (DDoS classifier, RAG pipeline walkthrough)
-tests/                      # pytest suite (retrieval + API)
+tests/                      # pytest suite (RAG + ML)
 frontend/
     src/
-        types/api.ts         # TypeScript types mirroring backend/models/schemas.py
+        types/api.ts, ml.ts   # TypeScript types mirroring the backend Pydantic models
         services/api.ts       # the only fetch() call site; typed, error-normalized
         hooks/                 # useHealth, useThreats
         components/
@@ -321,7 +473,7 @@ frontend/
             common/               # Card, PageHeader, SeverityBadge, StatusPill
             dashboard/            # StatCard
             analysis/             # QueryInput, SampleQueries, LoadingState, AnalysisResult, ...
-        pages/                  # DashboardPage, ThreatAnalysisPage, ThreatIntelligencePage, AboutPage
+        pages/                  # DashboardPage, ThreatAnalysisPage, NetworkDetectionPage, ThreatIntelligencePage, AboutPage
         App.tsx                 # router
 ```
 
@@ -339,11 +491,20 @@ frontend/
   or two techniques per file) — it is not a general ATT&CK reference.
 - The relevance threshold (`RAG_SCORE_THRESHOLD=1.5`) was tuned against this specific 14-chunk
   knowledge base; it should be re-validated if the corpus grows.
-- The Random Forest DDoS traffic classifier in `notebooks/01_data_exploration.ipynb` is a
-  separate, unintegrated experiment — it is not wired into `/analyze`.
 - There is no authentication, rate limiting, live threat feeds, or Docker/deployment setup yet.
 - The frontend was verified visually at desktop width (~1440px) and functionally end-to-end
   against the real backend + Ollama. Narrower breakpoints (tablet/mobile) are implemented with
   standard Tailwind responsive classes (sidebar collapses to a top bar below `lg`, card grids
   reflow via `sm`/`xl` columns) but were not independently confirmed by resizing a real browser
   viewport in this environment.
+- **No real trained classifier model is included or committed.** The actual CICIDS2017 dataset
+  was never available in the development environment this project was built in (see "Getting the
+  dataset" above) — `/classify` and `/analyze/classification` will return `503` until someone
+  runs `uv run python -m backend.ml.train` against the real CSV. The pipeline, leakage fix, API,
+  RAG integration, and frontend page were all built and verified against a small synthetic
+  fixture (see **Testing**) and a temporary demo dataset used only to visually confirm the UI
+  flow — neither represents real-world accuracy, and both were deleted afterward.
+- The classifier is binary (BENIGN/DDoS only) and single-threat, same as the original notebook —
+  it does not detect other attack types.
+- The Random Forest classifier only maps to one RAG query (DDoS → "How can DDoS attacks be
+  mitigated?"); this is the same query already proven to retrieve well in **Relevance Filtering**.

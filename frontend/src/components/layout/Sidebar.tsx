@@ -1,9 +1,10 @@
-import { Info, LayoutDashboard, Library, ShieldHalf, Search } from "lucide-react";
+import { Info, LayoutDashboard, Library, Radar, ShieldHalf, Search } from "lucide-react";
 import { NavLink } from "react-router-dom";
 
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/analyze", label: "Threat Analysis", icon: Search, end: false },
+  { to: "/detection", label: "Network Detection", icon: Radar, end: false },
   { to: "/intelligence", label: "Threat Intelligence", icon: Library, end: false },
   { to: "/about", label: "About", icon: Info, end: false },
 ];

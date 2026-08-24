@@ -1,4 +1,11 @@
 import type { AnalyzeRequest, HealthResponse, ThreatAnalysis, ThreatCategory } from "../types/api";
+import type {
+  ClassificationAnalysisRequest,
+  ClassificationAnalysisResponse,
+  ClassificationResult,
+  FeatureImportanceItem,
+  NetworkTrafficFeatures,
+} from "../types/ml";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
@@ -41,6 +48,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       const body = await response.json();
       if (typeof body?.detail === "string") {
         detail = body.detail;
+      } else if (Array.isArray(body?.detail)) {
+        // FastAPI/Pydantic validation errors: a list of {loc, msg, ...}.
+        const messages = body.detail
+          .slice(0, 5)
+          .map((error: { loc?: unknown[]; msg?: string }) => {
+            const field = Array.isArray(error.loc) ? error.loc.at(-1) : undefined;
+            return field ? `${field}: ${error.msg}` : error.msg;
+          })
+          .filter(Boolean);
+        if (messages.length > 0) {
+          detail = messages.join("; ");
+        }
       }
     } catch {
       // Response body wasn't JSON -- keep the generic message above.
@@ -66,4 +85,21 @@ export function getHealth(): Promise<HealthResponse> {
 
 export function getThreats(): Promise<ThreatCategory[]> {
   return request<ThreatCategory[]>("/threats");
+}
+
+export function classifyTraffic(features: NetworkTrafficFeatures): Promise<ClassificationResult> {
+  return request<ClassificationResult>("/classify", { method: "POST", body: JSON.stringify(features) });
+}
+
+export function getFeatureImportance(): Promise<FeatureImportanceItem[]> {
+  return request<FeatureImportanceItem[]>("/ml/feature-importance");
+}
+
+export function analyzeClassification(
+  payload: ClassificationAnalysisRequest,
+): Promise<ClassificationAnalysisResponse> {
+  return request<ClassificationAnalysisResponse>("/analyze/classification", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }

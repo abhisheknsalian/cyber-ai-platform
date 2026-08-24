@@ -3,6 +3,7 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { AppShell } from "./components/layout/AppShell";
 import { AboutPage } from "./pages/AboutPage";
 import { DashboardPage } from "./pages/DashboardPage";
+import { NetworkDetectionPage } from "./pages/NetworkDetectionPage";
 import { ThreatAnalysisPage } from "./pages/ThreatAnalysisPage";
 import { ThreatIntelligencePage } from "./pages/ThreatIntelligencePage";
 
@@ -13,6 +14,7 @@ function App() {
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/analyze" element={<ThreatAnalysisPage />} />
+          <Route path="/detection" element={<NetworkDetectionPage />} />
           <Route path="/intelligence" element={<ThreatIntelligencePage />} />
           <Route path="/about" element={<AboutPage />} />
         </Routes>
