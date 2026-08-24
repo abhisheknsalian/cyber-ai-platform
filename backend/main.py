@@ -1,6 +1,8 @@
 import logging
+import os
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.ml.predictor import ModelUnavailableError, feature_importance, model_available, predict
@@ -14,6 +16,7 @@ from backend.ml.schemas import (
 from backend.models.schemas import AnalyzeRequest, HealthResponse, ThreatAnalysis, ThreatCategory
 from backend.rag.config import COLLECTION_NAME
 from backend.rag.retrieval import vector_store_available, vector_store_chunk_count
+from backend.security import require_api_key
 from backend.services.classification import UnsupportedPredictionError, classify_and_analyze
 from backend.services.knowledge_base import list_threat_categories
 from backend.services.llm import LLMResponseError, LLMUnavailableError
@@ -23,14 +26,26 @@ from backend.services.threat_analysis import VectorStoreUnavailableError, analyz
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Cyber AI Platform")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not os.getenv("CYBER_AI_API_KEY"):
+        logger.warning(
+            "CYBER_AI_API_KEY is not set. The API will still start, but every request "
+            "to a protected endpoint (/analyze, /classify, /ml/feature-importance, "
+            "/analyze/classification) will be rejected with 401 until it is configured."
+        )
+    yield
+
+
+app = FastAPI(title="Cyber AI Platform", lifespan=lifespan)
 
 # Explicit dev origin for the Vite frontend (Step 12: no wildcard).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -60,7 +75,7 @@ def threats() -> list[ThreatCategory]:
 
 
 @app.post("/analyze", response_model=ThreatAnalysis)
-def analyze_threat(request: AnalyzeRequest) -> ThreatAnalysis:
+def analyze_threat(request: AnalyzeRequest, _: None = Depends(require_api_key)) -> ThreatAnalysis:
     try:
         return analyze_query(request.query)
     except VectorStoreUnavailableError:
@@ -93,7 +108,7 @@ def analyze_threat(request: AnalyzeRequest) -> ThreatAnalysis:
 
 
 @app.post("/classify", response_model=ClassificationResult)
-def classify_traffic(features: NetworkTrafficFeatures) -> ClassificationResult:
+def classify_traffic(features: NetworkTrafficFeatures, _: None = Depends(require_api_key)) -> ClassificationResult:
     """CICIDS2017-based DDoS/BENIGN traffic classification (Random Forest).
 
     Not a general-purpose malware detector and not a live network monitor -- this
@@ -126,7 +141,7 @@ def classify_traffic(features: NetworkTrafficFeatures) -> ClassificationResult:
 
 
 @app.get("/ml/feature-importance", response_model=list[FeatureImportanceItem])
-def ml_feature_importance(top_n: int = 15) -> list[FeatureImportanceItem]:
+def ml_feature_importance(top_n: int = 15, _: None = Depends(require_api_key)) -> list[FeatureImportanceItem]:
     """Top features by the trained Random Forest's own feature_importances_."""
     if not model_available():
         raise HTTPException(
@@ -140,7 +155,9 @@ def ml_feature_importance(top_n: int = 15) -> list[FeatureImportanceItem]:
 
 
 @app.post("/analyze/classification", response_model=ClassificationAnalysisResponse)
-def analyze_classification(request: ClassificationAnalysisRequest) -> ClassificationAnalysisResponse:
+def analyze_classification(
+    request: ClassificationAnalysisRequest, _: None = Depends(require_api_key)
+) -> ClassificationAnalysisResponse:
     """Take an already-computed classifier prediction (e.g. from POST /classify) and,
     if it's a threat, run it through the same RAG pipeline as /analyze. This does not
     re-run the classifier -- it only maps a given prediction to a threat report.

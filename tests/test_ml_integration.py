@@ -1,11 +1,23 @@
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.main import app
 from backend.models.schemas import LLMAnalysisFragment
+from backend.security import require_api_key
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _bypass_auth():
+    """This file tests classifier-to-RAG integration, not auth (see
+    tests/test_auth.py for that) -- FastAPI's dependency_overrides is the standard
+    way to isolate the two."""
+    app.dependency_overrides[require_api_key] = lambda: None
+    yield
+    app.dependency_overrides.pop(require_api_key, None)
 
 FAKE_FRAGMENT = LLMAnalysisFragment(
     severity="High",

@@ -405,6 +405,32 @@ All settings have sane local defaults and can be overridden with environment var
 | `RAG_SCORE_THRESHOLD` | `1.5` | Max distance score to be considered relevant (lower = more similar) |
 | `DDOS_DATASET_PATH` | `data/raw/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv` | CICIDS2017 CSV used by `backend.ml.train` |
 | `ML_MODEL_DIR` | `models` | Where the trained classifier artifact + metadata are saved/loaded |
+| `CYBER_AI_API_KEY` | *(unset)* | API key required by protected endpoints — see **Authentication** below. No default; there is no "dev bypass" value |
+
+## Authentication
+
+`POST /analyze`, `POST /classify`, `GET /ml/feature-importance`, and `POST /analyze/classification`
+require `Authorization: Bearer <CYBER_AI_API_KEY>`. `GET /`, `GET /health`, and `GET /threats` stay
+public.
+
+```bash
+export CYBER_AI_API_KEY="choose-your-own-local-value"   # never commit this
+uv run uvicorn backend.main:app --reload
+```
+
+If `CYBER_AI_API_KEY` isn't set, the API still starts (public endpoints keep working) but every
+protected request is rejected with `401` — there is no default key and no way to accidentally run
+the protected endpoints open. The key is compared with a constant-time comparison
+(`hmac.compare_digest`) and is never logged, echoed in an error response, or included in the
+OpenAPI schema.
+
+**The React frontend does not send this key.** It's a static, client-side-only SPA with no
+backend-for-frontend proxy, so there is nowhere to hold a secret that a browser can't also read
+out of the shipped JS bundle — baking the key into `VITE_*` would not actually protect it. As a
+result, once `CYBER_AI_API_KEY` is configured, the Threat Analysis, Network Detection, and any
+feature-importance UI will show a `401` error until a real client-auth story (e.g. a small
+backend-for-frontend proxy, or session-based auth) is added in a later phase. `GET /`, `/health`,
+and `/threats` (the Dashboard's data) are unaffected.
 
 ## Testing
 
