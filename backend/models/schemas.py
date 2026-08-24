@@ -86,6 +86,19 @@ class HealthResponse(BaseModel):
     llm: LLMStatus
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+
+
+class AuthStatusResponse(BaseModel):
+    """Response for /auth/login, /auth/logout, and /auth/me. Never carries the
+    session token itself -- that only ever travels via the HttpOnly cookie."""
+
+    authenticated: bool
+    username: str | None = None
+
+
 class ThreatAnalysis(BaseModel):
     """The /analyze response."""
 

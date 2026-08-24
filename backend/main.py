@@ -2,7 +2,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.ml.predictor import ModelUnavailableError, feature_importance, model_available, predict
@@ -13,15 +13,29 @@ from backend.ml.schemas import (
     FeatureImportanceItem,
     NetworkTrafficFeatures,
 )
-from backend.models.schemas import AnalyzeRequest, HealthResponse, ThreatAnalysis, ThreatCategory
+from backend.models.schemas import (
+    AnalyzeRequest,
+    AuthStatusResponse,
+    HealthResponse,
+    LoginRequest,
+    ThreatAnalysis,
+    ThreatCategory,
+)
 from backend.rag.config import COLLECTION_NAME
 from backend.rag.retrieval import vector_store_available, vector_store_chunk_count
-from backend.security import require_api_key
+from backend.security import require_auth
+from backend.services import auth as auth_service
 from backend.services.classification import UnsupportedPredictionError, classify_and_analyze
 from backend.services.knowledge_base import list_threat_categories
 from backend.services.llm import LLMResponseError, LLMUnavailableError
 from backend.services.llm_status import check_llm_status
 from backend.services.threat_analysis import VectorStoreUnavailableError, analyze_query
+from backend.sessions import (
+    CSRF_COOKIE_NAME,
+    SESSION_COOKIE_NAME,
+    SESSION_TTL_SECONDS,
+    is_valid_session,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,25 +47,101 @@ async def lifespan(app: FastAPI):
         logger.warning(
             "CYBER_AI_API_KEY is not set. The API will still start, but every request "
             "to a protected endpoint (/analyze, /classify, /ml/feature-importance, "
-            "/analyze/classification) will be rejected with 401 until it is configured."
+            "/analyze/classification) will be rejected with 401 until it is configured "
+            "(or a browser session is used instead -- see /auth/login)."
+        )
+    if not (os.getenv("CYBER_AI_USERNAME") and os.getenv("CYBER_AI_PASSWORD")):
+        logger.warning(
+            "CYBER_AI_USERNAME / CYBER_AI_PASSWORD are not both set. POST /auth/login "
+            "will reject every attempt until they are configured."
         )
     yield
 
 
 app = FastAPI(title="Cyber AI Platform", lifespan=lifespan)
 
-# Explicit dev origin for the Vite frontend (Step 12: no wildcard).
+# Explicit dev origin for the Vite frontend (Step 12 in Phase 3: no wildcard).
+# allow_credentials=True is required for the browser to send/receive the session +
+# CSRF cookies cross-origin (the frontend and backend run on different localhost
+# ports); it's only safe to combine with a wildcard-free, exact allow_origins list,
+# which this already is.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-CSRF-Token"],
 )
+
+
+def _set_auth_cookies(response: Response, session_token: str, csrf_token: str) -> None:
+    # SameSite=None is required because the frontend (localhost:5173) and backend
+    # (localhost:8000) are different origins -- Lax/Strict cookies are simply never
+    # sent on that cross-origin fetch. Secure=True is required to pair with
+    # SameSite=None; modern browsers treat http://localhost as a trustworthy origin
+    # for this purpose, so it still works without HTTPS in local dev.
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        max_age=SESSION_TTL_SECONDS,
+        path="/",
+    )
+    # Deliberately NOT HttpOnly: the frontend must be able to read this one to echo
+    # it back as the X-CSRF-Token header (double-submit pattern).
+    response.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=csrf_token,
+        httponly=False,
+        secure=True,
+        samesite="none",
+        max_age=SESSION_TTL_SECONDS,
+        path="/",
+    )
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    response.delete_cookie(CSRF_COOKIE_NAME, path="/")
 
 
 @app.get("/")
 def home():
     return {"message": "Cyber AI Platform Running"}
+
+
+@app.post("/auth/login", response_model=AuthStatusResponse)
+def login(payload: LoginRequest, response: Response) -> AuthStatusResponse:
+    """Browser session login. Public. Never logs or echoes the password."""
+    try:
+        session_token, csrf_token = auth_service.login(payload.username, payload.password)
+    except auth_service.InvalidCredentialsError:
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    except Exception:
+        logger.exception("Unexpected error during login")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while logging in.")
+
+    _set_auth_cookies(response, session_token, csrf_token)
+    return AuthStatusResponse(authenticated=True, username=payload.username)
+
+
+@app.post("/auth/logout", response_model=AuthStatusResponse)
+def logout(request: Request, response: Response) -> AuthStatusResponse:
+    """Destroys the current session, if any. Public and idempotent -- calling it
+    with no session (or an already-expired one) still succeeds."""
+    auth_service.logout(request.cookies.get(SESSION_COOKIE_NAME))
+    _clear_auth_cookies(response)
+    return AuthStatusResponse(authenticated=False)
+
+
+@app.get("/auth/me", response_model=AuthStatusResponse)
+def me(request: Request) -> AuthStatusResponse:
+    """Reports whether the current browser session is authenticated. Public --
+    this is how the frontend asks "am I logged in?" without ever erroring."""
+    authenticated = is_valid_session(request.cookies.get(SESSION_COOKIE_NAME))
+    return AuthStatusResponse(authenticated=authenticated, username=os.getenv("CYBER_AI_USERNAME") if authenticated else None)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -75,7 +165,7 @@ def threats() -> list[ThreatCategory]:
 
 
 @app.post("/analyze", response_model=ThreatAnalysis)
-def analyze_threat(request: AnalyzeRequest, _: None = Depends(require_api_key)) -> ThreatAnalysis:
+def analyze_threat(request: AnalyzeRequest, _: None = Depends(require_auth)) -> ThreatAnalysis:
     try:
         return analyze_query(request.query)
     except VectorStoreUnavailableError:
@@ -108,7 +198,7 @@ def analyze_threat(request: AnalyzeRequest, _: None = Depends(require_api_key)) 
 
 
 @app.post("/classify", response_model=ClassificationResult)
-def classify_traffic(features: NetworkTrafficFeatures, _: None = Depends(require_api_key)) -> ClassificationResult:
+def classify_traffic(features: NetworkTrafficFeatures, _: None = Depends(require_auth)) -> ClassificationResult:
     """CICIDS2017-based DDoS/BENIGN traffic classification (Random Forest).
 
     Not a general-purpose malware detector and not a live network monitor -- this
@@ -141,7 +231,7 @@ def classify_traffic(features: NetworkTrafficFeatures, _: None = Depends(require
 
 
 @app.get("/ml/feature-importance", response_model=list[FeatureImportanceItem])
-def ml_feature_importance(top_n: int = 15, _: None = Depends(require_api_key)) -> list[FeatureImportanceItem]:
+def ml_feature_importance(top_n: int = 15, _: None = Depends(require_auth)) -> list[FeatureImportanceItem]:
     """Top features by the trained Random Forest's own feature_importances_."""
     if not model_available():
         raise HTTPException(
@@ -156,7 +246,7 @@ def ml_feature_importance(top_n: int = 15, _: None = Depends(require_api_key)) -
 
 @app.post("/analyze/classification", response_model=ClassificationAnalysisResponse)
 def analyze_classification(
-    request: ClassificationAnalysisRequest, _: None = Depends(require_api_key)
+    request: ClassificationAnalysisRequest, _: None = Depends(require_auth)
 ) -> ClassificationAnalysisResponse:
     """Take an already-computed classifier prediction (e.g. from POST /classify) and,
     if it's a threat, run it through the same RAG pipeline as /analyze. This does not

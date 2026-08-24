@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from backend.main import app
 from backend.models.schemas import LLMAnalysisFragment
-from backend.security import require_api_key
+from backend.security import require_auth
 from backend.services.llm import LLMResponseError, LLMUnavailableError
 
 client = TestClient(app)
@@ -15,9 +15,9 @@ client = TestClient(app)
 def _bypass_auth():
     """This file tests RAG/business logic, not auth (see tests/test_auth.py for
     that) -- FastAPI's dependency_overrides is the standard way to isolate the two."""
-    app.dependency_overrides[require_api_key] = lambda: None
+    app.dependency_overrides[require_auth] = lambda: None
     yield
-    app.dependency_overrides.pop(require_api_key, None)
+    app.dependency_overrides.pop(require_auth, None)
 
 FAKE_FRAGMENT = LLMAnalysisFragment(
     severity="Medium",

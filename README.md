@@ -374,6 +374,10 @@ hand-built with Tailwind.
 - **Threat Intelligence** (`/intelligence`) — the threat categories from `GET /threats`, i.e.
   exactly what's in `data/threat_intel/`.
 - **About** (`/about`) — architecture explanation; states plainly what is and isn't implemented.
+- **Login** — shown instead of the app for an unauthenticated session (see **Authentication**).
+  `AuthProvider`/`useAuth` (`frontend/src/context/AuthContext.tsx`) call `GET /auth/me` on startup,
+  gate all five pages above behind `authenticated`, and drop back to the login page automatically
+  if any request ever comes back `401`. The sidebar's "Log out" button calls `POST /auth/logout`.
 
 **API integration**: `frontend/src/services/api.ts` is the only place that calls `fetch`;
 `analyzeThreat`/`getHealth`/`getThreats`/`classifyTraffic`/`getFeatureImportance`/`analyzeClassification`
@@ -385,8 +389,9 @@ single `ApiError` with a user-facing message — no raw errors or stack traces r
 **Configuration**: the backend URL is read from `VITE_API_URL` (see `frontend/.env.example`),
 defaulting to `http://localhost:8000` if unset. Never commit `frontend/.env`.
 
-**CORS**: the backend explicitly allows `http://localhost:5173` (the Vite dev server) via
-`CORSMiddleware` in `backend/main.py` — not a wildcard.
+**CORS**: the backend explicitly allows only `http://localhost:5173` (the Vite dev server), with
+`allow_credentials=True` so the session/CSRF cookies can be sent — never a wildcard origin, which
+is a hard requirement for combining CORS with credentials in the first place.
 
 ## Configuration
 
@@ -405,32 +410,82 @@ All settings have sane local defaults and can be overridden with environment var
 | `RAG_SCORE_THRESHOLD` | `1.5` | Max distance score to be considered relevant (lower = more similar) |
 | `DDOS_DATASET_PATH` | `data/raw/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv` | CICIDS2017 CSV used by `backend.ml.train` |
 | `ML_MODEL_DIR` | `models` | Where the trained classifier artifact + metadata are saved/loaded |
-| `CYBER_AI_API_KEY` | *(unset)* | API key required by protected endpoints — see **Authentication** below. No default; there is no "dev bypass" value |
+| `CYBER_AI_API_KEY` | *(unset)* | API key for direct API clients — see **Authentication** below. No default |
+| `CYBER_AI_USERNAME` | *(unset)* | Browser login username — see **Authentication** below. No default |
+| `CYBER_AI_PASSWORD` | *(unset)* | Browser login password — see **Authentication** below. No default |
 
 ## Authentication
 
 `POST /analyze`, `POST /classify`, `GET /ml/feature-importance`, and `POST /analyze/classification`
-require `Authorization: Bearer <CYBER_AI_API_KEY>`. `GET /`, `GET /health`, and `GET /threats` stay
-public.
+require authentication. `GET /`, `GET /health`, `GET /threats`, and `GET/POST /auth/*` stay public.
+There are two independent credential paths, either of which satisfies a protected request:
+
+```text
+Direct API client:  Authorization: Bearer <CYBER_AI_API_KEY>  ─┐
+                                                                 ├─→ protected endpoint
+Browser:             HttpOnly session cookie (+ CSRF header)  ─┘
+```
+
+### Direct API clients
 
 ```bash
 export CYBER_AI_API_KEY="choose-your-own-local-value"   # never commit this
 uv run uvicorn backend.main:app --reload
 ```
 
-If `CYBER_AI_API_KEY` isn't set, the API still starts (public endpoints keep working) but every
-protected request is rejected with `401` — there is no default key and no way to accidentally run
-the protected endpoints open. The key is compared with a constant-time comparison
-(`hmac.compare_digest`) and is never logged, echoed in an error response, or included in the
-OpenAPI schema.
+```bash
+curl -H "Authorization: Bearer $CYBER_AI_API_KEY" http://127.0.0.1:8000/classify -d '...'
+```
 
-**The React frontend does not send this key.** It's a static, client-side-only SPA with no
-backend-for-frontend proxy, so there is nowhere to hold a secret that a browser can't also read
-out of the shipped JS bundle — baking the key into `VITE_*` would not actually protect it. As a
-result, once `CYBER_AI_API_KEY` is configured, the Threat Analysis, Network Detection, and any
-feature-importance UI will show a `401` error until a real client-auth story (e.g. a small
-backend-for-frontend proxy, or session-based auth) is added in a later phase. `GET /`, `/health`,
-and `/threats` (the Dashboard's data) are unaffected.
+If `CYBER_AI_API_KEY` isn't set, the API still starts (public endpoints keep working) but this
+path is always rejected with `401` — there is no default key. The key is compared with a
+constant-time comparison (`hmac.compare_digest`) and is never logged, echoed in a response, or
+included in the OpenAPI schema.
+
+### Browser (the React frontend)
+
+**The frontend never receives or sends `CYBER_AI_API_KEY`.** It's a static, client-side-only SPA
+with no backend-for-frontend proxy, so there is nowhere to hold that secret a browser couldn't
+also read out of the shipped JS bundle. Instead, the frontend uses a server-side session:
+
+```text
+POST /auth/login {username, password}
+   → backend/services/auth.py validates against CYBER_AI_USERNAME / CYBER_AI_PASSWORD
+     (hmac.compare_digest, both fields always compared so timing can't reveal which was wrong)
+   → backend/sessions.py creates an in-memory session: a cryptographically random
+     token (secrets.token_urlsafe(32)), no user data or secrets encoded in it
+   → two cookies are set:
+       cyber_ai_session  -- HttpOnly, Secure, SameSite=None -- the actual credential,
+                             unreadable by JS
+       cyber_ai_csrf     -- NOT HttpOnly, Secure, SameSite=None -- a paired token the
+                             frontend reads and echoes back as X-CSRF-Token on every
+                             state-changing (non-GET) request ("double-submit" CSRF
+                             defense; see backend/sessions.py)
+```
+
+```bash
+export CYBER_AI_USERNAME="choose-your-own-local-username"
+export CYBER_AI_PASSWORD="choose-your-own-local-password"
+```
+
+`SameSite=None` is required (not a weaker choice) because the frontend (`:5173`) and backend
+(`:8000`) are different origins — a stricter SameSite cookie is simply never sent on that
+cross-origin `fetch`. That in turn removes the browser's own CSRF mitigation, which is why the
+double-submit CSRF header exists on top of it. CORS is locked to the exact frontend origin with
+`allow_credentials=True` (never a wildcard) as the other half of that defense.
+
+Sessions are stored in-process (`backend/sessions.py`) and are lost on restart — appropriate for
+this single-process local application; there is no database or Redis dependency for it.
+
+`GET /auth/me` (public, always `200`) is how the frontend asks "am I logged in?" on startup.
+`POST /auth/logout` destroys the session server-side and clears both cookies. Neither endpoint,
+nor `/auth/login`, ever returns the session token, CSRF token, password, or API key in a response
+body — only the two cookies carry them, and the CSRF cookie carries a value that's useless without
+the paired HttpOnly session cookie a script can't read.
+
+**Known limitation:** if a protected request ever returns `401` (e.g. session expired), the
+frontend drops back to the login page (see `AuthContext`) — but there's no automatic retry of the
+in-flight request after re-login; the user re-submits it.
 
 ## Testing
 
@@ -459,6 +514,16 @@ Covered:
 - The synthetic fixture's intentional duplicate rows are removed by `load_and_clean_dataset` (leakage-fix regression test)
 - `/classify` handles a valid request, a missing feature, an invalid feature type, an unexpected extra field, and a not-yet-trained model
 - `/analyze/classification` maps `DDoS` → a `ddos_attack` RAG analysis, maps `BENIGN` → `analysis: null` **without calling the LLM**, and rejects an unsupported prediction
+- API-key auth: missing/invalid/malformed `Authorization` header → `401`; valid key → unchanged behavior; a misconfigured (unset) `CYBER_AI_API_KEY` fails closed rather than crashing or running open
+- Session auth: login success/invalid-username/invalid-password/missing-credentials, logout destroys the session, `/auth/me` before and after login, a valid session (+ CSRF header) reaches a protected endpoint, a session without the CSRF header (or with the wrong one) is rejected on state-changing requests
+- Security regression checks: the session cookie is `HttpOnly` or the CSRF cookie is deliberately not, no response body ever contains the password/session token/CSRF token, and none of those values (nor the API key) ever appear in captured log output
+
+Frontend automated tests were not added in this phase (no test runner existed for `frontend/`
+before it, and adding one — e.g. Vitest + Testing Library — is a separate infrastructure decision
+from browser auth integration). The login/logout/redirect flows were verified manually: open the
+app signed out, confirm the login page renders, sign in, confirm the app renders and the session
+cookie is `HttpOnly` (unreadable from the browser console), sign out, confirm the login page
+returns.
 
 ## Project Structure
 
@@ -484,23 +549,27 @@ backend/
         knowledge_base.py     # discovers threat categories for /threats
         threat_analysis.py    # orchestrates retrieval -> MITRE extraction -> LLM -> response
         classification.py     # maps a classifier prediction -> the RAG pipeline above
+        auth.py                # login credential validation (backend/sessions.py owns session storage)
+    security.py             # require_auth: API key OR session+CSRF, either satisfies protected routes
+    sessions.py              # in-memory session store (backend/sessions.py) -- see Authentication
 data/threat_intel/         # source threat-intelligence documents
 data/raw/                   # CICIDS2017 CSV goes here (gitignored, not committed)
 models/                      # trained classifier artifact + metadata (gitignored, not committed)
 notebooks/                 # exploratory notebooks (DDoS classifier, RAG pipeline walkthrough)
-tests/                      # pytest suite (RAG + ML)
+tests/                      # pytest suite (RAG + ML + auth)
 frontend/
     src/
-        types/api.ts, ml.ts   # TypeScript types mirroring the backend Pydantic models
-        services/api.ts       # the only fetch() call site; typed, error-normalized
-        hooks/                 # useHealth, useThreats
+        types/api.ts, ml.ts, auth.ts   # TypeScript types mirroring the backend Pydantic models
+        services/api.ts                 # the only fetch() call site; typed, error-normalized, sends cookies
+        context/AuthContext.tsx          # auth state; calls GET /auth/me on startup, listens for 401s
+        hooks/                            # useHealth, useThreats
         components/
-            layout/              # AppShell, Sidebar
+            layout/              # AppShell, Sidebar (incl. logout button)
             common/               # Card, PageHeader, SeverityBadge, StatusPill
             dashboard/            # StatCard
             analysis/             # QueryInput, SampleQueries, LoadingState, AnalysisResult, ...
-        pages/                  # DashboardPage, ThreatAnalysisPage, NetworkDetectionPage, ThreatIntelligencePage, AboutPage
-        App.tsx                 # router
+        pages/                  # LoginPage, DashboardPage, ThreatAnalysisPage, NetworkDetectionPage, ThreatIntelligencePage, AboutPage
+        App.tsx                 # router + auth gate
 ```
 
 ## Known Limitations

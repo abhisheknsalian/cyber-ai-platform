@@ -78,7 +78,7 @@ def test_protected_endpoint_without_header_returns_401(monkeypatch, method, path
     monkeypatch.setenv("CYBER_AI_API_KEY", TEST_KEY)
     response = _send(method, path, body)
     assert response.status_code == 401
-    assert response.json()["detail"] == "Missing or invalid API key."
+    assert response.json()["detail"] == "Authentication required."
 
 
 @pytest.mark.parametrize("method,path,body", PROTECTED_REQUESTS)

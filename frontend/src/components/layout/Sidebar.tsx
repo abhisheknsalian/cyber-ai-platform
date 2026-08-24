@@ -1,5 +1,7 @@
-import { Info, LayoutDashboard, Library, Radar, ShieldHalf, Search } from "lucide-react";
+import { Info, LayoutDashboard, Library, LogOut, Radar, ShieldHalf, Search } from "lucide-react";
 import { NavLink } from "react-router-dom";
+
+import { useAuth } from "../../context/AuthContext";
 
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
@@ -10,6 +12,8 @@ const NAV_ITEMS = [
 ];
 
 export function Sidebar() {
+  const { username, logout } = useAuth();
+
   return (
     <aside className="flex shrink-0 flex-col border-b border-border bg-surface-raised lg:w-64 lg:border-b-0 lg:border-r">
       <div className="flex items-center gap-2.5 border-b border-border px-5 py-4 lg:py-5">
@@ -41,8 +45,19 @@ export function Sidebar() {
         ))}
       </nav>
 
-      <div className="mt-auto hidden border-t border-border px-5 py-4 lg:block">
-        <p className="text-xs text-text-faint">Local-first · RAG + Ollama</p>
+      <div className="mt-auto flex items-center justify-between gap-2 border-t border-border px-5 py-4">
+        <div className="hidden lg:block">
+          <p className="text-xs text-text-faint">Local-first · RAG + Ollama</p>
+          {username ? <p className="mt-0.5 text-xs text-text-muted">Signed in as {username}</p> : null}
+        </div>
+        <button
+          type="button"
+          onClick={() => logout()}
+          className="flex items-center gap-1.5 rounded-md border border-transparent px-2 py-1.5 text-xs text-text-muted transition-colors hover:border-border-strong hover:bg-surface-hover hover:text-text"
+        >
+          <LogOut className="h-3.5 w-3.5" strokeWidth={1.75} />
+          Log out
+        </button>
       </div>
     </aside>
   );

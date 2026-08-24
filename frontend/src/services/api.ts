@@ -1,4 +1,5 @@
 import type { AnalyzeRequest, HealthResponse, ThreatAnalysis, ThreatCategory } from "../types/api";
+import type { AuthStatusResponse, LoginRequest } from "../types/auth";
 import type {
   ClassificationAnalysisRequest,
   ClassificationAnalysisResponse,
@@ -11,6 +12,20 @@ const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
 const REQUEST_TIMEOUT_MS = 60_000;
 
+// Must match backend/sessions.py exactly. The CSRF cookie is deliberately NOT
+// HttpOnly -- reading it here and echoing it back as a header is the whole point of
+// the double-submit CSRF pattern. This is not a secret: it only proves this page's
+// own JS (not a third-party site) made the request; the actual credential is the
+// separate, HttpOnly session cookie that this code can never read.
+const CSRF_COOKIE_NAME = "cyber_ai_csrf";
+const CSRF_HEADER_NAME = "X-CSRF-Token";
+
+/** Dispatched whenever any request comes back 401, except /auth/login itself (a
+ * failed login attempt isn't "your session expired"). AuthContext listens for this
+ * to drop the app back to the login page instead of leaving pages stuck on a
+ * generic error. */
+export const UNAUTHORIZED_EVENT = "cyber-ai:unauthorized";
+
 /** Thrown for every failure mode: network-down, timeout, non-2xx, and malformed responses. */
 export class ApiError extends Error {
   readonly status: number | null;
@@ -22,16 +37,37 @@ export class ApiError extends Error {
   }
 }
 
+function readCookie(name: string): string | null {
+  const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  const method = (init?.method ?? "GET").toUpperCase();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(init?.headers as Record<string, string> | undefined),
+  };
+
+  // CSRF header is only meaningful (and only checked server-side) for
+  // state-changing requests authenticated by the session cookie.
+  if (method !== "GET" && method !== "HEAD") {
+    const csrfToken = readCookie(CSRF_COOKIE_NAME);
+    if (csrfToken) {
+      headers[CSRF_HEADER_NAME] = csrfToken;
+    }
+  }
 
   let response: Response;
   try {
     response = await fetch(`${API_URL}${path}`, {
       ...init,
+      credentials: "include", // send/receive the HttpOnly session + CSRF cookies
       signal: controller.signal,
-      headers: { "Content-Type": "application/json", ...init?.headers },
+      headers,
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
@@ -43,6 +79,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   if (!response.ok) {
+    if (response.status === 401 && path !== "/auth/login") {
+      window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+    }
+
     let detail = `Request failed with status ${response.status}.`;
     try {
       const body = await response.json();
@@ -72,6 +112,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   } catch {
     throw new ApiError("The backend returned a response that could not be understood.");
   }
+}
+
+export function login(payload: LoginRequest): Promise<AuthStatusResponse> {
+  return request<AuthStatusResponse>("/auth/login", { method: "POST", body: JSON.stringify(payload) });
+}
+
+export function logout(): Promise<AuthStatusResponse> {
+  return request<AuthStatusResponse>("/auth/logout", { method: "POST" });
+}
+
+export function getAuthStatus(): Promise<AuthStatusResponse> {
+  return request<AuthStatusResponse>("/auth/me");
 }
 
 export function analyzeThreat(query: string): Promise<ThreatAnalysis> {
