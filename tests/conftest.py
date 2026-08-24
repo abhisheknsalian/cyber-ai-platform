@@ -65,3 +65,20 @@ def _test_ml_model():
     train_model()
     yield
     shutil.rmtree(_TEST_ML_DIR, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiters():
+    """Phase 8 added in-memory rate limiting to POST /auth/login, /analyze, /classify,
+    and /analyze/classification. Without a reset between every test, the many
+    pre-existing tests that call those endpoints repeatedly (test_session_auth.py,
+    test_api.py, test_ml_api.py, ...) would eventually trip the limiter and start
+    failing with spurious 429s -- autouse so it applies globally, not just to the
+    dedicated rate-limit tests."""
+    from backend.rate_limit import AI_RATE_LIMIT, LOGIN_RATE_LIMIT
+
+    LOGIN_RATE_LIMIT.reset()
+    AI_RATE_LIMIT.reset()
+    yield
+    LOGIN_RATE_LIMIT.reset()
+    AI_RATE_LIMIT.reset()

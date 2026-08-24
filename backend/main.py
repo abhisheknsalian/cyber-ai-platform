@@ -3,8 +3,14 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
+from backend.config_validation import ConfigurationError, validate_startup_config
+from backend.logging_config import configure_logging
+from backend.middleware import RequestContextMiddleware, SecurityHeadersMiddleware
 from backend.ml.predictor import ModelUnavailableError, feature_importance, model_available, predict
 from backend.ml.schemas import (
     ClassificationAnalysisRequest,
@@ -18,11 +24,14 @@ from backend.models.schemas import (
     AuthStatusResponse,
     HealthResponse,
     LoginRequest,
+    ReadinessChecks,
+    ReadinessResponse,
     ThreatAnalysis,
     ThreatCategory,
 )
 from backend.rag.config import COLLECTION_NAME
 from backend.rag.retrieval import vector_store_available, vector_store_chunk_count
+from backend.rate_limit import enforce_ai_rate_limit, enforce_login_rate_limit
 from backend.security import require_auth
 from backend.services import auth as auth_service
 from backend.services.classification import UnsupportedPredictionError, classify_and_analyze
@@ -37,12 +46,22 @@ from backend.sessions import (
     is_valid_session,
 )
 
-logging.basicConfig(level=logging.INFO)
+configure_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        validate_startup_config()
+    except ConfigurationError as exc:
+        # Fails startup outright for a malformed *non-secret* setting -- unlike the
+        # two warnings below, this can't be "fixed later while the app keeps serving
+        # public endpoints", because e.g. a CORS_ORIGINS containing '*' combined with
+        # allow_credentials=True is a real misconfiguration, not a deferred choice.
+        logger.error("Startup configuration invalid: %s", exc, extra={"event": "config_invalid"})
+        raise
+
     if not os.getenv("CYBER_AI_API_KEY"):
         logger.warning(
             "CYBER_AI_API_KEY is not set. The API will still start, but every request "
@@ -55,10 +74,20 @@ async def lifespan(app: FastAPI):
             "CYBER_AI_USERNAME / CYBER_AI_PASSWORD are not both set. POST /auth/login "
             "will reject every attempt until they are configured."
         )
+    logger.info("Cyber AI Platform starting up", extra={"event": "startup"})
     yield
+    logger.info("Cyber AI Platform shutting down", extra={"event": "shutdown"})
 
 
 app = FastAPI(title="Cyber AI Platform", lifespan=lifespan)
+
+# Order matters: Starlette executes middleware outer-to-inner in *reverse* of
+# add_middleware() call order, so the last one added runs first/outermost. Security
+# headers should wrap everything (including error responses), and request-ID/timing
+# should be the very outermost so it captures the full request lifecycle -- so it's
+# added last.
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestContextMiddleware)
 
 # Explicit origin allowlist (Step 12 in Phase 3: no wildcard) -- configurable via
 # CORS_ORIGINS (comma-separated) so the Dockerized frontend's origin (e.g.
@@ -116,16 +145,23 @@ def home():
 
 
 @app.post("/auth/login", response_model=AuthStatusResponse)
-def login(payload: LoginRequest, response: Response) -> AuthStatusResponse:
-    """Browser session login. Public. Never logs or echoes the password."""
+def login(
+    payload: LoginRequest,
+    response: Response,
+    _: None = Depends(enforce_login_rate_limit),
+) -> AuthStatusResponse:
+    """Browser session login. Public (rate-limited by IP). Never logs or echoes the
+    username or password -- only whether the attempt succeeded."""
     try:
         session_token, csrf_token = auth_service.login(payload.username, payload.password)
     except auth_service.InvalidCredentialsError:
+        logger.warning("Login failed", extra={"event": "login_failure"})
         raise HTTPException(status_code=401, detail="Invalid username or password.")
     except Exception:
         logger.exception("Unexpected error during login")
         raise HTTPException(status_code=500, detail="An unexpected error occurred while logging in.")
 
+    logger.info("Login succeeded", extra={"event": "login_success"})
     _set_auth_cookies(response, session_token, csrf_token)
     return AuthStatusResponse(authenticated=True, username=payload.username)
 
@@ -149,7 +185,13 @@ def me(request: Request) -> AuthStatusResponse:
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    """Reports API/vector-store/LLM status. Does not run any LLM inference."""
+    """Process/application health -- always 200 while the process is up and able to
+    handle a request, regardless of whether Ollama/the vector store/the classifier
+    happen to be ready. Reports their status for visibility but never fails or blocks
+    on them, and never runs LLM inference. This is the process *liveness* signal (see
+    README "Health vs Readiness"); for whether protected functionality can actually
+    be served, use GET /ready instead. Unchanged response shape from Phase 6 -- kept
+    stable for existing clients."""
     return HealthResponse(
         status="ok",
         vector_store=dict(
@@ -161,6 +203,26 @@ def health() -> HealthResponse:
     )
 
 
+@app.get("/ready", response_model=ReadinessResponse)
+def ready(response: Response) -> ReadinessResponse:
+    """Readiness: whether the runtime dependencies required for the protected AI
+    endpoints (RAG, classifier, LLM) are actually available right now. Distinct from
+    GET /health (see above) -- this can and does return 503 when e.g. Ollama isn't
+    running or no model has been trained yet, which /health deliberately never does.
+    Like /health, this never runs LLM generation -- check_llm_status() only calls
+    ollama.list() (metadata), and model_available()/vector_store_available() are
+    cheap existence checks, so this stays fast and doesn't slow down startup probes.
+    """
+    checks = ReadinessChecks(
+        vector_store=vector_store_available(),
+        llm=check_llm_status().reachable,
+        classifier=model_available(),
+    )
+    is_ready = checks.vector_store and checks.llm and checks.classifier
+    response.status_code = 200 if is_ready else 503
+    return ReadinessResponse(ready=is_ready, checks=checks)
+
+
 @app.get("/threats", response_model=list[ThreatCategory])
 def threats() -> list[ThreatCategory]:
     """Threat categories actually present in data/threat_intel/, for the frontend."""
@@ -168,10 +230,15 @@ def threats() -> list[ThreatCategory]:
 
 
 @app.post("/analyze", response_model=ThreatAnalysis)
-def analyze_threat(request: AnalyzeRequest, _: None = Depends(require_auth)) -> ThreatAnalysis:
+def analyze_threat(
+    request: AnalyzeRequest,
+    _: None = Depends(enforce_ai_rate_limit),
+    __: None = Depends(require_auth),
+) -> ThreatAnalysis:
     try:
         return analyze_query(request.query)
     except VectorStoreUnavailableError:
+        logger.warning("Vector store unavailable", extra={"event": "vector_store_unavailable"})
         raise HTTPException(
             status_code=503,
             detail=(
@@ -180,6 +247,7 @@ def analyze_threat(request: AnalyzeRequest, _: None = Depends(require_auth)) -> 
             ),
         )
     except LLMUnavailableError:
+        logger.warning("LLM unavailable", extra={"event": "llm_unavailable"})
         raise HTTPException(
             status_code=503,
             detail=(
@@ -188,12 +256,13 @@ def analyze_threat(request: AnalyzeRequest, _: None = Depends(require_auth)) -> 
             ),
         )
     except LLMResponseError:
+        logger.warning("LLM response failed schema validation", extra={"event": "llm_response_invalid"})
         raise HTTPException(
             status_code=502,
             detail="The LLM returned a response that could not be parsed into a valid analysis.",
         )
     except Exception:
-        logger.exception("Unexpected error while analyzing query: %r", request.query)
+        logger.exception("Unexpected error while analyzing query", extra={"event": "analyze_error"})
         raise HTTPException(
             status_code=500,
             detail="An unexpected error occurred while analyzing the query.",
@@ -201,7 +270,11 @@ def analyze_threat(request: AnalyzeRequest, _: None = Depends(require_auth)) -> 
 
 
 @app.post("/classify", response_model=ClassificationResult)
-def classify_traffic(features: NetworkTrafficFeatures, _: None = Depends(require_auth)) -> ClassificationResult:
+def classify_traffic(
+    features: NetworkTrafficFeatures,
+    _: None = Depends(enforce_ai_rate_limit),
+    __: None = Depends(require_auth),
+) -> ClassificationResult:
     """CICIDS2017-based DDoS/BENIGN traffic classification (Random Forest).
 
     Not a general-purpose malware detector and not a live network monitor -- this
@@ -218,6 +291,7 @@ def classify_traffic(features: NetworkTrafficFeatures, _: None = Depends(require
     try:
         return predict(features)
     except ModelUnavailableError:
+        logger.warning("Classifier unavailable", extra={"event": "classifier_unavailable"})
         raise HTTPException(
             status_code=503,
             detail=(
@@ -226,7 +300,7 @@ def classify_traffic(features: NetworkTrafficFeatures, _: None = Depends(require
             ),
         )
     except Exception:
-        logger.exception("Unexpected error during classification")
+        logger.exception("Unexpected error during classification", extra={"event": "classify_error"})
         raise HTTPException(
             status_code=500,
             detail="An unexpected error occurred while classifying the traffic sample.",
@@ -249,7 +323,9 @@ def ml_feature_importance(top_n: int = 15, _: None = Depends(require_auth)) -> l
 
 @app.post("/analyze/classification", response_model=ClassificationAnalysisResponse)
 def analyze_classification(
-    request: ClassificationAnalysisRequest, _: None = Depends(require_auth)
+    request: ClassificationAnalysisRequest,
+    _: None = Depends(enforce_ai_rate_limit),
+    __: None = Depends(require_auth),
 ) -> ClassificationAnalysisResponse:
     """Take an already-computed classifier prediction (e.g. from POST /classify) and,
     if it's a threat, run it through the same RAG pipeline as /analyze. This does not
@@ -261,6 +337,7 @@ def analyze_classification(
     except UnsupportedPredictionError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except VectorStoreUnavailableError:
+        logger.warning("Vector store unavailable", extra={"event": "vector_store_unavailable"})
         raise HTTPException(
             status_code=503,
             detail=(
@@ -269,6 +346,7 @@ def analyze_classification(
             ),
         )
     except LLMUnavailableError:
+        logger.warning("LLM unavailable", extra={"event": "llm_unavailable"})
         raise HTTPException(
             status_code=503,
             detail=(
@@ -277,13 +355,69 @@ def analyze_classification(
             ),
         )
     except LLMResponseError:
+        logger.warning("LLM response failed schema validation", extra={"event": "llm_response_invalid"})
         raise HTTPException(
             status_code=502,
             detail="The LLM returned a response that could not be parsed into a valid analysis.",
         )
     except Exception:
-        logger.exception("Unexpected error while analyzing classification: %r", request)
+        logger.exception("Unexpected error while analyzing classification", extra={"event": "analyze_classification_error"})
         raise HTTPException(
             status_code=500,
             detail="An unexpected error occurred while analyzing the classification.",
         )
+
+
+# --- Error response envelope -------------------------------------------------
+#
+# All three handlers below add a `request_id` field alongside the existing `detail`
+# field, purely additively -- `detail`'s shape (a string for HTTPException, a list of
+# {loc, msg, ...} for validation errors) is unchanged, so frontend/src/services/api.ts
+# (which branches on typeof body.detail) keeps working without modification. Nothing
+# here changes a status code that was already being returned.
+#
+# Reads the ID from request.state (set by RequestContextMiddleware before call_next),
+# not the get_request_id() contextvar: registering a handler for the base Exception
+# class makes Starlette treat it as ServerErrorMiddleware's handler, which sits
+# OUTSIDE every user middleware (including RequestContextMiddleware) -- by the time it
+# runs, that middleware's own `finally: reset_request_id(...)` has already fired, so
+# the contextvar would already be back to its previous value. request.state isn't
+# contextvar-based and isn't affected by that reset.
+
+
+def _request_id_of(request: Request) -> str | None:
+    return getattr(request.state, "request_id", None)
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "request_id": _request_id_of(request)},
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # jsonable_encoder is required here (matching FastAPI's own default handler):
+    # exc.errors() can include a `ctx` field carrying the raw exception object from a
+    # custom @field_validator (e.g. AnalyzeRequest.not_blank's ValueError), which
+    # isn't JSON-serializable on its own.
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(exc.errors()), "request_id": _request_id_of(request)},
+    )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # Safety net for any route with no explicit try/except (e.g. GET /threats,
+    # GET /ml/feature-importance) or a genuinely unexpected bug elsewhere. Full
+    # traceback goes to the server log only -- filesystem paths, Python internals, and
+    # environment details never reach the HTTP response.
+    logger.exception("Unhandled exception", extra={"event": "unhandled_exception", "path": request.url.path})
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected error occurred.", "request_id": _request_id_of(request)},
+    )

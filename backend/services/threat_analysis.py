@@ -1,9 +1,13 @@
+import logging
 import re
+import time
 
 from backend.models.schemas import MitreTechnique, SourceRef, ThreatAnalysis
 from backend.rag.config import RAG_SCORE_THRESHOLD, RAG_TOP_K, THREAT_INTEL_DIR
 from backend.rag.retrieval import retrieve_relevant, vector_store_available
 from backend.services.llm import generate_analysis_fragment
+
+logger = logging.getLogger("backend.rag")
 
 MITRE_PATTERN = re.compile(r"(T\d{4})\s*:\s*(.+)")
 
@@ -40,7 +44,20 @@ def analyze_query(query: str) -> ThreatAnalysis:
     if not vector_store_available():
         raise VectorStoreUnavailableError("Vector store has not been built yet")
 
+    # Logs query length, not the query text itself -- the text can be arbitrary user
+    # input and isn't needed to understand retrieval behavior operationally.
+    start = time.perf_counter()
     relevant = retrieve_relevant(query, k=RAG_TOP_K, threshold=RAG_SCORE_THRESHOLD)
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    logger.info(
+        "RAG retrieval completed",
+        extra={
+            "event": "rag_retrieval",
+            "query_length": len(query),
+            "retrieved_count": len(relevant),
+            "duration_ms": duration_ms,
+        },
+    )
 
     if not relevant:
         return ThreatAnalysis(query=query, status="no_relevant_intelligence", summary=NO_MATCH_SUMMARY)
@@ -68,6 +85,11 @@ def analyze_query(query: str) -> ThreatAnalysis:
     ]
     mitre = _extract_mitre_techniques({s.source for s in sources})
     context = "\n\n".join(doc.page_content for doc, _score in primary_chunks)
+
+    logger.info(
+        "RAG primary threat selected",
+        extra={"event": "rag_threat_selected", "threat": primary_threat, "source_count": len(sources)},
+    )
 
     fragment = generate_analysis_fragment(query, context)
 

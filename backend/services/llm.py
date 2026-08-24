@@ -1,4 +1,5 @@
 import logging
+import time
 
 import ollama
 from pydantic import ValidationError
@@ -36,6 +37,7 @@ User Query:
 
 Respond only with JSON matching the required schema."""
 
+    start = time.perf_counter()
     try:
         response = ollama.chat(
             model=OLLAMA_MODEL,
@@ -47,16 +49,34 @@ Respond only with JSON matching the required schema."""
             options={"temperature": 0},
         )
     except Exception as exc:
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        logger.warning(
+            "LLM invocation failed",
+            extra={"event": "llm_invocation", "model": OLLAMA_MODEL, "success": False, "duration_ms": duration_ms},
+        )
         raise LLMUnavailableError(
             f"Could not reach Ollama model '{OLLAMA_MODEL}': {exc}"
         ) from exc
 
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
     content = response["message"]["content"]
 
     try:
-        return LLMAnalysisFragment.model_validate_json(content)
+        fragment = LLMAnalysisFragment.model_validate_json(content)
     except ValidationError as exc:
-        logger.warning("LLM response failed schema validation: %s", content[:500])
+        # Logs a truncated excerpt (not the full response) -- enough to diagnose a
+        # schema mismatch without writing an unbounded amount of model output to logs.
+        logger.warning(
+            "LLM response failed schema validation: %s",
+            content[:500],
+            extra={"event": "llm_invocation", "model": OLLAMA_MODEL, "success": False, "duration_ms": duration_ms},
+        )
         raise LLMResponseError(
             "LLM returned a response that did not match the expected schema"
         ) from exc
+
+    logger.info(
+        "LLM invocation completed",
+        extra={"event": "llm_invocation", "model": OLLAMA_MODEL, "success": True, "duration_ms": duration_ms},
+    )
+    return fragment

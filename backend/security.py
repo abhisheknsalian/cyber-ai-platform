@@ -14,12 +14,15 @@ endpoint returns 401.
 """
 
 import hmac
+import logging
 import os
 
 from fastapi import HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from backend.sessions import CSRF_HEADER_NAME, SESSION_COOKIE_NAME, csrf_token_for, is_valid_session
+
+logger = logging.getLogger("backend.auth")
 
 # auto_error=False so we control the status code ourselves -- FastAPI's default
 # HTTPBearer raises 403 on a missing/malformed header, but the spec here requires 401
@@ -65,9 +68,15 @@ def require_auth(
     accidentally runs open.
     """
     if _valid_api_key(credentials):
+        logger.info("Authentication succeeded", extra={"event": "auth_success", "method": "api_key"})
         return
     if _valid_session_request(request):
+        logger.info("Authentication succeeded", extra={"event": "auth_success", "method": "session"})
         return
+    logger.warning(
+        "Authentication failed",
+        extra={"event": "auth_failure", "path": request.url.path},
+    )
     raise HTTPException(
         status_code=401,
         detail=_UNAUTHORIZED_DETAIL,

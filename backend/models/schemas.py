@@ -86,6 +86,24 @@ class HealthResponse(BaseModel):
     llm: LLMStatus
 
 
+class ReadinessChecks(BaseModel):
+    """Per-dependency detail behind GET /ready's overall `ready` flag."""
+
+    vector_store: bool
+    llm: bool
+    classifier: bool
+
+
+class ReadinessResponse(BaseModel):
+    """GET /ready: whether required runtime dependencies are available for serving
+    protected functionality (RAG + classifier + LLM). Distinct from GET /health,
+    which only reports process/application health and never reflects the classifier
+    or fails the request -- see README "Health vs Readiness"."""
+
+    ready: bool
+    checks: ReadinessChecks
+
+
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1)
     password: str = Field(..., min_length=1)

@@ -98,15 +98,16 @@ accumulates stale or duplicate chunks.
 ## Backend Endpoints
 
 - `GET /` — basic liveness message
-- `GET /health` — API/vector-store/LLM status (does not run LLM inference — see below)
+- `GET /health` — process/application health (does not run LLM inference — see below)
+- `GET /ready` — readiness: whether RAG/classifier/LLM dependencies are actually available (Phase 8; see **Observability & Operations** > "Health vs Readiness")
 - `GET /threats` — threat categories discovered from `data/threat_intel/*.txt`, for the frontend
-- `POST /analyze` — structured, retrieval-grounded threat analysis
-- `POST /classify` — DDoS/BENIGN network-traffic classification (Random Forest); see **ML Detection Pipeline**
+- `POST /analyze` — structured, retrieval-grounded threat analysis (rate-limited)
+- `POST /classify` — DDoS/BENIGN network-traffic classification (Random Forest); see **ML Detection Pipeline** (rate-limited)
 - `GET /ml/feature-importance` — the trained model's own `feature_importances_`, ranked
-- `POST /analyze/classification` — takes an already-computed classifier prediction and runs it through the same RAG pipeline as `/analyze`
+- `POST /analyze/classification` — takes an already-computed classifier prediction and runs it through the same RAG pipeline as `/analyze` (rate-limited)
 - `GET /docs` — interactive Swagger UI
 
-`GET /health` response:
+`GET /health` response (unchanged since Phase 6):
 
 ```json
 {
@@ -117,7 +118,10 @@ accumulates stale or duplicate chunks.
 ```
 
 `llm.reachable`/`model_pulled` come from listing installed Ollama models (`ollama.list()`) — this
-is a status check, not a generation call, so `/health` still never invokes the LLM.
+is a status check, not a generation call, so `/health` still never invokes the LLM. `GET /ready`
+uses the same underlying checks (plus whether a trained classifier is present) but, unlike
+`/health`, returns HTTP 503 when something required is actually down — see **Observability &
+Operations** for the full distinction and why both exist.
 
 ## API Contract
 
@@ -415,12 +419,32 @@ All settings have sane local defaults and can be overridden with environment var
 | `CYBER_AI_API_KEY` | *(unset)* | API key for direct API clients — see **Authentication** below. No default |
 | `CYBER_AI_USERNAME` | *(unset)* | Browser login username — see **Authentication** below. No default |
 | `CYBER_AI_PASSWORD` | *(unset)* | Browser login password — see **Authentication** below. No default |
+| `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed browser origins — see **Docker Compose** > "CORS reconfiguration" |
+| `RATE_LIMIT_LOGIN_MAX` | `5` | Max `POST /auth/login` attempts per IP per window — see **Observability & Operations** > "Rate Limiting" |
+| `RATE_LIMIT_LOGIN_WINDOW_SECONDS` | `60` | Window for the login limit above |
+| `RATE_LIMIT_AI_MAX` | `20` | Max combined `/analyze` + `/classify` + `/analyze/classification` calls per IP per window |
+| `RATE_LIMIT_AI_WINDOW_SECONDS` | `60` | Window for the AI-endpoint limit above |
+
+**Validation and fail-safe behavior** (Phase 8, `backend/config_validation.py`): `RAG_TOP_K` /
+`RAG_SCORE_THRESHOLD` / etc. are parsed at import time and already fail startup immediately on a
+malformed value. `CORS_ORIGINS` is validated explicitly at startup — a wildcard (`*`, which can
+never be combined safely with `allow_credentials=True`) or a non-`http(s)://` entry raises a clear
+`ConfigurationError` and refuses to start, rather than silently running with a broken or unsafe
+CORS policy. A malformed `RATE_LIMIT_*` value does *not* fail startup — it logs a warning and falls
+back to the documented default (see `backend/rate_limit.py`), since a bad rate-limit number is an
+inconvenience, not a security hole, and shouldn't be able to take the whole API down. Missing
+secrets (`CYBER_AI_API_KEY`/`_USERNAME`/`_PASSWORD`) are intentionally **not** fatal — the app
+starts and logs a warning, so public endpoints keep working while secrets are still being
+provisioned; every protected endpoint independently fails closed to `401` until they're set. No
+startup log ever prints a secret's actual value, only whether it's configured.
 
 ## Authentication
 
 `POST /analyze`, `POST /classify`, `GET /ml/feature-importance`, and `POST /analyze/classification`
-require authentication. `GET /`, `GET /health`, `GET /threats`, and `GET/POST /auth/*` stay public.
-There are two independent credential paths, either of which satisfies a protected request:
+require authentication. `GET /`, `GET /health`, `GET /ready`, `GET /threats`, and `GET/POST /auth/*`
+stay public (though `POST /auth/login` and the four endpoints above are rate-limited — see
+**Observability & Operations**). There are two independent credential paths, either of which
+satisfies a protected request:
 
 ```text
 Direct API client:  Authorization: Bearer <CYBER_AI_API_KEY>  ─┐
@@ -488,6 +512,137 @@ the paired HttpOnly session cookie a script can't read.
 **Known limitation:** if a protected request ever returns `401` (e.g. session expired), the
 frontend drops back to the login page (see `AuthContext`) — but there's no automatic retry of the
 in-flight request after re-login; the user re-submits it.
+
+## Observability & Operations
+
+Phase 8 hardens the backend operationally: structured logs, request correlation, a
+readiness/health split, security headers, and lightweight rate limiting. None of this changes the
+RAG pipeline, the classifier, authentication behavior, or any existing API response shape —
+everything below is additive. This is **production-hardened, local-first** tooling, not a claim
+that the system is "production ready" in the sense of a multi-tenant, horizontally-scaled,
+internet-facing deployment — see "Known limitations" at the end of this section for exactly why.
+
+### Structured logging
+
+Every log line is a single JSON object (`backend/logging_config.py`) with `timestamp`, `level`,
+`logger`, `request_id`, and `message`, plus free-form structured fields via the stdlib logging
+`extra=` mechanism (`event`, `duration_ms`, `status_code`, etc. — whatever's relevant to that
+event). Replaces the earlier `logging.basicConfig(...)` default format entirely; nothing else about
+how modules obtain a logger (`logging.getLogger(__name__)`) changed.
+
+Logged events include: application startup/shutdown, every request received/completed (with
+method, path, status code, duration), authentication success/failure, login success/failure,
+rate-limit rejections, RAG retrieval (duration, retrieved-chunk count, selected threat type —
+**never the query text itself**, only its length), classifier inference (prediction, probability,
+duration — **never the input feature vector**), and LLM invocation (model, success/failure,
+duration — **never the prompt or the full response**; a validation failure logs at most a 500-
+character excerpt for debugging, unchanged from Phase 2).
+
+**Never logged, anywhere:** the API key, the configured username/password, session tokens, CSRF
+tokens, the raw `Authorization` header, or full request bodies containing any of the above. This is
+enforced by convention and verified by tests (`tests/test_session_auth.py`'s pre-existing
+`test_credentials_never_appear_in_logs`/`test_session_token_never_appears_in_logs`, plus
+`tests/test_error_handling.py`'s new secret-leakage checks) — login logs only *whether* an attempt
+succeeded, never the attempted username or password.
+
+### Request IDs
+
+`RequestContextMiddleware` (`backend/middleware.py`) assigns every request a correlation ID:
+it accepts an incoming `X-Request-ID` header if present and looks safe (alphanumeric/`-`/`_`,
+≤128 characters — anything else, including newlines or absurd lengths, is replaced rather than
+trusted, to prevent log injection or storage abuse), otherwise generates one
+(`secrets.token_urlsafe(16)`). The ID is attached to `request.state`, included in every log line
+for that request (via a `contextvars.ContextVar`, so nested service-layer code doesn't need the
+request object threaded through it), returned in the `X-Request-ID` response header, and included
+in every error response body alongside `detail`. **It is never treated as a credential** — `
+require_auth()` never reads it, and a syntactically perfect request ID does not grant access to
+anything.
+
+### Health vs Readiness
+
+- **`GET /health`** — process/application liveness. Always `200` while the process can handle a
+  request, regardless of whether Ollama, the vector store, or the classifier are actually working.
+  Reports their status for visibility but never fails or blocks on them, and never runs LLM
+  inference. Response shape is byte-for-byte unchanged from Phase 6 — existing clients (the
+  frontend's `useHealth` hook, the Docker `HEALTHCHECK`) keep working exactly as before.
+- **`GET /ready`** *(new)* — whether the dependencies required to actually serve the protected AI
+  endpoints are available right now: vector store built, Ollama reachable, a trained classifier
+  present. Returns `200` with `{"ready": true, "checks": {...}}` when all three are up, or `503`
+  with `{"ready": false, "checks": {...}}` the moment any one isn't. Like `/health`, this never runs
+  LLM generation (`check_llm_status()` only calls `ollama.list()`) and never trains or loads a model
+  just to answer the question, so it stays fast and doesn't slow down startup probes.
+
+**Docker health checks deliberately still target `/health`, not `/ready`** (`Dockerfile`,
+`docker-compose.yml`). This is a considered choice, not an oversight: the backend `healthcheck`
+gates `depends_on: condition: service_healthy` for the frontend container. If it targeted `/ready`
+instead, the whole stack would fail to come up whenever Ollama simply hadn't been started yet
+(or was briefly slow to respond) — a normal, recoverable situation in this local-first
+architecture, not a reason to block the container from being considered "up." `/health` answers
+"is the container alive and able to accept connections," which is exactly what container
+orchestration health checks are for; `/ready` is available for a caller (or a future, stricter
+orchestrator) that specifically wants "is the full AI pipeline actually servable."
+
+### Security headers
+
+Every backend response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and
+`Referrer-Policy: strict-origin-when-cross-origin` (`SecurityHeadersMiddleware`,
+`backend/middleware.py`). A strict `Content-Security-Policy: default-src 'none'; frame-ancestors
+'none'` is applied to every JSON API response — safe because this API never itself serves
+renderable HTML/JS to a browser — except `/docs`, `/redoc`, and `/openapi.json`, which are excluded
+because FastAPI's own Swagger/ReDoc UI loads its JS/CSS from a CDN and would otherwise break.
+Responses from every `/auth/*` path additionally get `Cache-Control: no-store`, so no intermediary
+or browser cache retains session-adjacent responses. None of this touches `CORSMiddleware`'s
+existing origin allowlist.
+
+The frontend's `nginx.conf` gets the same three baseline headers (`X-Content-Type-Options`,
+`X-Frame-Options`, `Referrer-Policy`). It deliberately does **not** get a CSP: the backend URL this
+SPA calls is only known at container *startup* (see **Docker Compose** > "Runtime-configurable
+backend URL"), not when `nginx.conf` is written, so a static `connect-src` would either have to be
+wildcarded (defeating the purpose) or risk breaking the app against whatever backend URL Compose
+actually injects — evaluated and deliberately skipped rather than shipping something that could
+silently break the real application.
+
+### Rate limiting
+
+An in-memory sliding-window limiter (`backend/rate_limit.py`) protects the highest-risk endpoints:
+`POST /auth/login` (`RATE_LIMIT_LOGIN_MAX`/`_WINDOW_SECONDS`, default 5 per 60s) and the three AI
+endpoints `POST /analyze` / `POST /classify` / `POST /analyze/classification`, which **share one
+budget** (`RATE_LIMIT_AI_MAX`/`_WINDOW_SECONDS`, default 20 per 60s combined) so a caller can't
+multiply their effective quota by switching endpoints. Keyed by client IP only — **never by
+username or API key** — specifically because rate-limiting login by the attempted username would
+let an attacker distinguish "this username exists and got throttled" from "this username doesn't
+exist," reopening exactly the enumeration channel the generic "Invalid username or password" error
+already closes. Exceeding a limit returns `429` with a `Retry-After` header and a generic message;
+the response body never reveals hit counts or any other client's state. Public endpoints (`/`,
+`/health`, `/ready`, `/threats`, `GET /auth/me`, `POST /auth/logout`) are never rate-limited.
+
+No account lockout was added deliberately: a lockout that a remote, unauthenticated caller can
+trigger by attempting a known username with wrong passwords is itself a denial-of-service vector
+against the legitimate user of that account. IP-based rate limiting throttles brute-forcing without
+creating that mechanism.
+
+**Known limitation — this is genuinely per-process state.** The limiter is a plain Python dict
+guarded by a `threading.Lock`, living in the memory of a single backend process. That's correct and
+sufficient for the current `docker-compose.yml` architecture (exactly one `backend` container,
+`uvicorn` run without `--workers`, so exactly one process ever holds it) — but it is **not** a
+distributed rate-limiting solution. Running multiple backend replicas, or `uvicorn --workers N`,
+would give each process its own independent counters, effectively multiplying the real limit by the
+process count. Making it distributed would require a shared store (Redis, most likely) — not
+introduced in Phase 8, since nothing in this project's current single-instance architecture
+demonstrates a need for one yet.
+
+### Error responses
+
+Every error response — a deliberate `HTTPException`, a Pydantic validation `422`, or a genuinely
+unhandled exception anywhere (a safety net for routes like `GET /threats` that have no try/except
+of their own) — is JSON with a `detail` field (unchanged shape: a string, or FastAPI's usual list
+of `{loc, msg, ...}` for validation errors, so `frontend/src/services/api.ts`'s existing parsing
+keeps working with no frontend changes) plus a `request_id` field added alongside it. An unhandled
+exception's full traceback is always logged server-side (with the request ID) and **never** appears
+in the HTTP response — the client only ever sees `{"detail": "An unexpected error occurred.",
+"request_id": "..."}`. No filesystem path, Python traceback, environment variable, or secret value
+has ever been observed in a response body in this codebase's error paths (verified in
+`tests/test_error_handling.py`).
 
 ## Docker Backend
 
@@ -613,6 +768,11 @@ external dependency happens to be perfect. Note: right after a fresh container s
 health check or two can be slow (and may transiently report unhealthy under the default 5s
 timeout) while the embedding model referenced above finishes its first load — this settles once
 that's cached in memory.
+
+`GET /ready` (Phase 8) is available for checking whether the AI pipeline itself is actually
+servable (`curl http://localhost:8000/ready`) but is deliberately **not** what the Docker
+`HEALTHCHECK`/Compose healthcheck targets — see **Observability & Operations** > "Health vs
+Readiness" for why.
 
 ### Testing authentication in the container
 
@@ -763,9 +923,9 @@ with "Connection refused" even though the server is up — found live while veri
 - Direct API-key access to the published backend port still works independently of the browser
   session (`Authorization: Bearer <CYBER_AI_API_KEY>` against `http://localhost:8000`).
 - Security: missing/invalid API key → `401` on protected endpoints; public endpoints (`/`,
-  `/health`, `/threats`, `/auth/me`) remain reachable with no credentials; a CORS preflight from an
-  origin *not* in `CORS_ORIGINS` (`http://evil.example.com`) is rejected (`400`, no
-  `Access-Control-Allow-Origin` header); a preflight from `http://localhost:8080` is allowed.
+  `/health`, `/ready`, `/threats`, `/auth/me`) remain reachable with no credentials; a CORS
+  preflight from an origin *not* in `CORS_ORIGINS` (`http://evil.example.com`) is rejected (`400`,
+  no `Access-Control-Allow-Origin` header); a preflight from `http://localhost:8080` is allowed.
 - Confirmed the built frontend JS bundle contains no backend secrets, API keys, or passwords
   (`grep` over `frontend/dist/assets/*.js`).
 - A project-wide scan for AI-tool branding/attribution strings (source tree, `frontend/dist/`, and
@@ -784,8 +944,6 @@ caveat).
 
 ### Known limitations
 
-- No CI/build pipeline runs any of this automatically (out of scope — see **Known Limitations**
-  below).
 - No HTTPS/TLS termination for either container; both are plain HTTP, matching every prior phase's
   local-first, localhost-only scope. `Secure` cookies still work because modern browsers treat
   `http://localhost` as a trustworthy origin for that purpose.
@@ -795,6 +953,11 @@ caveat).
   specific to this image.
 - The backend's port is published to the host because the browser needs to reach it directly (see
   **Networking** above) — this is structural to the chosen architecture, not an oversight.
+- Both services use `restart: unless-stopped` (Phase 8) — a crashed container or a host reboot
+  brings it back automatically, but a deliberate `docker compose stop`/`down` is still respected.
+  This is single-container restart behavior, not a health-driven failover: nothing routes traffic
+  away from a backend that's `unhealthy`-but-still-running (e.g. Ollama down) since there's only
+  ever one backend container in this architecture.
 
 ## CI/CD
 
@@ -972,7 +1135,9 @@ docker-compose.yml               # wires the backend + frontend images together 
   or two techniques per file) — it is not a general ATT&CK reference.
 - The relevance threshold (`RAG_SCORE_THRESHOLD=1.5`) was tuned against this specific 14-chunk
   knowledge base; it should be re-validated if the corpus grows.
-- There is no rate limiting or live threat feed integration.
+- Rate limiting (Phase 8) is per-process, in-memory, and IP-keyed — see **Observability &
+  Operations** > "Rate Limiting" for exactly what that does and doesn't cover. There is no live
+  threat feed integration.
 - The frontend was verified visually at desktop width (~1440px) and functionally end-to-end
   against the real backend + Ollama. Narrower breakpoints (tablet/mobile) are implemented with
   standard Tailwind responsive classes (sidebar collapses to a top bar below `lg`, card grids
