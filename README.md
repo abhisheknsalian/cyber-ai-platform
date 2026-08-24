@@ -487,6 +487,167 @@ the paired HttpOnly session cookie a script can't read.
 frontend drops back to the login page (see `AuthContext`) — but there's no automatic retry of the
 in-flight request after re-login; the user re-submits it.
 
+## Docker Backend
+
+A production-style container for the **FastAPI backend only** (Phase 6.1). The frontend, Ollama,
+the trained Random Forest model, the CICIDS2017 dataset, and the Chroma vector store are all
+intentionally **not** part of this image:
+
+- **The CICIDS2017 dataset is not included in the image.** It's gitignored and was never part of
+  the build context beyond `.dockerignore` explicitly excluding it a second time.
+- **The trained classifier is not included in the image.** `models/` is empty in the built image
+  (just an owned, writable mount point) — the real `.joblib` + metadata are supplied at runtime.
+- **No secrets are included in the image.** `CYBER_AI_API_KEY`, `CYBER_AI_USERNAME`,
+  `CYBER_AI_PASSWORD`, and `OLLAMA_*` are all read from the container's environment at runtime,
+  never baked in.
+- **Ollama is external to this container.** It is not installed inside the image; the backend
+  reaches it over the network via `OLLAMA_HOST`.
+
+### Prerequisites
+
+- Docker
+- A trained model at `models/ddos_random_forest.joblib` (+ its metadata JSON) — see **ML Detection
+  Pipeline** above for how to produce it; it is not built inside the container in this phase.
+- A built Chroma vector store at `rag/chroma_db/` — see **Build the Vector Database** above.
+- Ollama running and reachable from the container (see below).
+
+### Build
+
+```bash
+docker build -t cyber-ai-backend .
+```
+
+Two stages: the first resolves the existing `pyproject.toml`/`uv.lock` dependency set with `uv
+sync --frozen --no-dev --no-install-project` (reproducible install, no second dependency list, no
+dev/test tooling); the second is a fresh `python:3.12-slim` image containing only that installed
+virtualenv plus `backend/` and `data/threat_intel/` — never `COPY . .`. `data/threat_intel/*.txt`
+is a genuine runtime dependency, not just an ingestion-time one: `backend/services/
+knowledge_base.py` (`GET /threats`) and `backend/services/threat_analysis.py`'s MITRE extraction
+both read those files directly on every request, so they're copied into the image (they're
+tracked in git and contain nothing sensitive).
+
+### Required environment variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `CYBER_AI_API_KEY` | Yes, for direct API clients | See **Authentication** |
+| `CYBER_AI_USERNAME` / `CYBER_AI_PASSWORD` | Yes, for browser/session auth | See **Authentication** |
+| `OLLAMA_HOST` | Yes | Where Ollama is reachable from inside the container — see below |
+| `OLLAMA_MODEL` | No (defaults to `llama3.2:3b`) | Passed through unchanged |
+| Everything in **Configuration** above | No | Same env vars, same defaults, work identically in the container |
+
+### Required volume mounts
+
+| Container path | Contents | Mode |
+|---|---|---|
+| `/app/models` | `ddos_random_forest.joblib` + `.metadata.json` | Read-only is fine — `joblib.load()` only reads |
+| `/app/rag/chroma_db` | The built Chroma collection | **Must be read-write**, not read-only — Chroma opens the SQLite file in a mode that needs to write WAL/journal files even for pure reads. A read-only mount here fails with `attempt to write a readonly database` (found during Phase 6.1 verification) |
+
+Both paths already exist inside the image, owned by the non-root runtime user, specifically so a
+bind mount or named volume onto either "just works" without extra host-side permission changes.
+
+### Providing the model artifact
+
+Train it on the host first (outside Docker, per **ML Detection Pipeline**), then bind-mount the
+resulting directory — do not create a fake/synthetic model to satisfy the container.
+
+### Providing the Chroma vector store
+
+Either:
+1. Build it on the host first (`uv run python -m backend.rag.ingestion`, per **Build the Vector
+   Database**) and bind-mount the resulting `rag/chroma_db/` directory, or
+2. Mount an empty/named volume at `/app/rag/chroma_db` and build it *inside* the running
+   container: `docker exec <container> python -m backend.rag.ingestion`. The container needs
+   outbound internet access the first time, to download the `sentence-transformers/all-MiniLM-L6-v2`
+   embedding model from Hugging Face Hub — it is not pre-baked or cached in the image, so the very
+   first request that touches retrieval (including `GET /health`) will be slower while it
+   downloads, then stays cached in that process's memory for the container's lifetime.
+
+### Connecting to Ollama
+
+The backend never installs or bundles Ollama — it talks to it over HTTP exactly like local dev
+does, just with `OLLAMA_HOST` pointed at wherever Ollama actually runs:
+
+```bash
+# macOS/Windows Docker Desktop: the host is reachable via this special DNS name
+-e OLLAMA_HOST="http://host.docker.internal:11434"
+
+# Linux: host.docker.internal isn't available by default; either run with
+# --add-host=host.docker.internal:host-gateway, or point OLLAMA_HOST at the host's
+# real LAN/bridge IP.
+```
+
+This required zero code changes: the `ollama` Python client already reads `OLLAMA_HOST` from the
+environment when constructing its default client (verified by reading `ollama/_client.py` in the
+installed package) — `backend/services/llm.py` and `llm_status.py` were untouched in this phase.
+
+### Run
+
+```bash
+docker run -d --name cyber-ai-backend \
+  -p 8000:8000 \
+  -v "$(pwd)/models:/app/models:ro" \
+  -v "$(pwd)/rag/chroma_db:/app/rag/chroma_db" \
+  -e OLLAMA_HOST="http://host.docker.internal:11434" \
+  -e OLLAMA_MODEL="llama3.2:3b" \
+  -e CYBER_AI_API_KEY="your-api-key" \
+  -e CYBER_AI_USERNAME="your-username" \
+  -e CYBER_AI_PASSWORD="your-password" \
+  cyber-ai-backend
+```
+
+### Health check
+
+```bash
+curl http://localhost:8000/health
+```
+
+The image also has a built-in `HEALTHCHECK` (`docker ps` shows `healthy`/`unhealthy`) that hits
+this same endpoint using the stdlib (no curl/wget installed just for this). `GET /health` never
+invokes the LLM — `check_llm_status()` only calls `ollama.list()` (a metadata call), never
+`chat()` — so the healthcheck reflects whether the API process itself is up, not whether every
+external dependency happens to be perfect. Note: right after a fresh container start, the first
+health check or two can be slow (and may transiently report unhealthy under the default 5s
+timeout) while the embedding model referenced above finishes its first load — this settles once
+that's cached in memory.
+
+### Testing authentication in the container
+
+Identical behavior to local dev — same `require_auth()` code, unmodified:
+
+```bash
+# Public, no credentials needed
+curl http://localhost:8000/health
+
+# Protected, no credentials -> 401
+curl -i -X POST http://localhost:8000/classify -H "Content-Type: application/json" -d '{}'
+
+# Protected, valid API key -> normal behavior
+curl -X POST http://localhost:8000/classify \
+  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
+  -d '{...78 features...}'
+```
+
+### Known limitations
+
+- No `docker-compose.yml` yet (explicitly out of scope for this phase) — the model volume, Chroma
+  volume, and Ollama connection all have to be wired up by hand with `docker run` flags, as above.
+- The full `pyproject.toml` dependency set is installed as-is (per this phase's scope: no second
+  dependency list, no splitting into extras) — this includes notebook-only packages (`jupyter`,
+  `matplotlib`, `ipykernel`) and `torch` (pulled in by `sentence-transformers`) that the API itself
+  never uses, making the image far larger than a trimmed backend-only dependency set would be.
+  Splitting `pyproject.toml` into optional-dependency groups is a reasonable follow-up but wasn't
+  done here to stay in scope.
+- No persistent Hugging Face cache volume — the embedding model is re-downloaded from the internet
+  on every fresh container start (see "Providing the Chroma vector store" above).
+- Sessions (Phase 5.2) are in-memory in the FastAPI process, same as local dev: restarting the
+  container logs everyone out. Unaffected by containerization, just worth restating here.
+- Frontend↔container browser verification (login/session cookies against a *containerized*
+  backend from an actual browser) was not performed in this phase — the frontend isn't
+  containerized yet. This is planned for Phase 6.3. What *was* verified here is that the
+  container's auth behavior (API-key 401/200, public endpoints) is identical to local dev via
+  direct HTTP requests.
+
 ## Testing
 
 ```bash

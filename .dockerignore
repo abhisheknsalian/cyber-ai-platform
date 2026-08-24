@@ -1,0 +1,38 @@
+# Version control / CI (none exists yet, excluded defensively)
+.git
+.github
+
+# Python virtual environment and caches
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+
+# Secrets -- never present in this repo, excluded defensively
+.env
+.env.*
+
+# Gitignored runtime/data artifacts -- must never be baked into the image.
+# The real dataset and trained model are supplied externally at runtime (see the
+# README "Docker Backend" section), and the vector store is either built inside the
+# running container or bind-mounted from a host build.
+data/raw
+models
+rag/chroma_db
+rag/multi_threat_db
+
+# Frontend is not part of this image (Phase 6.1 is backend-only)
+frontend/node_modules
+frontend/dist
+frontend
+
+# Not needed at runtime
+notebooks
+tests
+.dockerignore
+Dockerfile*
+
+# OS files
+.DS_Store
+Thumbs.db
