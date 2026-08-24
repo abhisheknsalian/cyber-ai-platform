@@ -1,5 +1,7 @@
 # Cyber AI Platform
 
+[![CI](https://github.com/abhisheknsalian/cyber-ai-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/abhisheknsalian/cyber-ai-platform/actions/workflows/ci.yml)
+
 A local, retrieval-augmented cybersecurity threat-intelligence analysis platform: a React
 dashboard backed by a FastAPI service. The backend embeds a small knowledge base of threat
 write-ups (`data/threat_intel/*.txt`) into a Chroma vector store and uses a locally-running
@@ -793,6 +795,73 @@ caveat).
   specific to this image.
 - The backend's port is published to the host because the browser needs to reach it directly (see
   **Networking** above) — this is structural to the chosen architecture, not an oversight.
+
+## CI/CD
+
+`.github/workflows/ci.yml` runs automatically on every push to `main` and every pull request
+targeting `main`. It validates that the project, exactly as tracked in git, is reproducibly
+correct — nothing more. Three independent jobs:
+
+| Job | Steps | Validates |
+|---|---|---|
+| `backend-tests` | checkout → `astral-sh/setup-uv` → `uv sync --frozen` → `uv run pytest tests/ -v` | The backend test suite (currently 78 tests) |
+| `frontend-quality` | checkout → `actions/setup-node` (Node 22) → `npm ci` → `npm run lint` → `npm run build` | The frontend lints and builds cleanly |
+| `docker-build` | checkout → `docker build -t cyber-ai-backend .` → `docker build -t cyber-ai-frontend ./frontend` | Both images are reproducibly buildable from tracked source |
+
+`docker-build` only runs after both quality jobs succeed (`needs: [backend-tests,
+frontend-quality]`), so a broken image is never the first signal something's wrong.
+
+### Why the real dataset, trained model, and Ollama are not required
+
+- **CICIDS2017 dataset / trained model**: `tests/conftest.py` builds a small synthetic dataset
+  (real column names, clearly-fake values) and trains a real model against it before any test
+  runs — this exercises the full pipeline's plumbing without needing the real 225k-row file. See
+  **ML Detection Pipeline** above. `docker build` for the backend image never needs either: both
+  are gitignored runtime artifacts supplied at `docker run`/`docker compose up`, not at build time.
+- **Ollama**: `GET /health`'s LLM check only calls `ollama.list()` (metadata), never generation, and
+  nothing in the test suite or either `docker build` invokes an LLM at all. The backend image talks
+  to Ollama over the network at *runtime*; building the image doesn't require it to exist.
+- **Chroma vector store**: same as the model — a gitignored runtime artifact, not a build input.
+  `conftest.py` builds an isolated, temporary one for the test suite only.
+- **Real credentials**: no test or Docker build step needs `CYBER_AI_API_KEY`/`_USERNAME`/`_PASSWORD`.
+  Auth tests use `monkeypatch.setenv` with test-only fake values (`test_auth.py`,
+  `test_session_auth.py`) or `app.dependency_overrides[require_auth]` (`test_api.py`,
+  `test_ml_api.py`) — the same isolation architecture from Phases 5.1/5.2, unchanged. The workflow
+  file itself contains no secrets of any kind.
+
+### Reproducibility
+
+- `uv sync --frozen` installs exactly what `uv.lock` already pins — CI fails loudly instead of
+  silently re-resolving if the lockfile and `pyproject.toml` ever drift apart. The Python version
+  comes from the project's own `.python-version` (uv reads it automatically); nothing is hardcoded
+  a second time in the workflow.
+- `npm ci` installs exactly what `package-lock.json` pins, same as the frontend Docker build.
+- Both `docker build` commands are the same commands documented in **Docker Backend** and **Docker
+  Compose** above — CI runs nothing bespoke.
+
+### Permissions and secrets
+
+The workflow declares `permissions: contents: read` at the top level and nothing more — no job
+pushes commits, comments on pull requests, or publishes anything, so read-only is sufficient
+everywhere. No images are pushed to any registry and no registry credentials are configured.
+
+### Caching
+
+`astral-sh/setup-uv` (`enable-cache: true`) and `actions/setup-node` (`cache: npm`) each use their
+own official, lockfile-keyed cache — no hand-rolled `actions/cache` configuration.
+
+### Local equivalents
+
+Everything CI runs can be run locally with the exact same commands:
+
+```bash
+uv run pytest tests/ -v
+
+cd frontend && npm ci && npm run lint && npm run build
+
+docker build -t cyber-ai-backend .
+docker build -t cyber-ai-frontend ./frontend
+```
 
 ## Testing
 

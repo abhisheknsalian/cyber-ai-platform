@@ -1,0 +1,88 @@
+name: CI
+
+# Validates that the project as tracked in git is reproducibly correct: the backend
+# test suite passes, the frontend lints/builds, and both Docker images build from
+# source. Deliberately does NOT run the full stack (docker compose up) -- that needs
+# the real CICIDS2017 dataset, a trained model, a built Chroma store, and an external
+# Ollama instance, none of which are (or should be) available to a CI runner. See the
+# README "CI/CD" section for the full rationale.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least-privilege default: nothing in this workflow pushes commits, comments on PRs,
+# publishes packages, or uploads releases, so read-only is sufficient everywhere.
+permissions:
+  contents: read
+
+jobs:
+  backend-tests:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installs uv and, via its built-in cache (keyed on uv.lock), speeds up
+      # repeat installs across runs. No python-version input: uv reads the
+      # project's own .python-version file automatically, so the Python version
+      # used here always matches what the project actually declares.
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      # --frozen: install exactly what uv.lock pins, and fail instead of silently
+      # re-resolving/updating it if pyproject.toml and the lock ever drift out of
+      # sync. Includes the dev dependency-group (pytest) -- unlike the Docker image,
+      # which deliberately excludes it with --no-dev since it never runs tests.
+      - run: uv sync --frozen
+
+      # tests/conftest.py builds an isolated synthetic dataset and a temporary
+      # Chroma store before any backend module is imported, and every
+      # auth-related test sets its own fake credentials via monkeypatch.setenv or
+      # a dependency_overrides. No real dataset, trained model, Ollama instance,
+      # or real secret is required to run this suite.
+      - run: uv run pytest tests/ -v
+
+  frontend-quality:
+    name: Frontend lint & build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # Installs exactly what package-lock.json pins (reproducible), unlike
+      # `npm install`.
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  docker-build:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    # Only build images once both quality gates are green, so a broken image build
+    # is never the first (or only) signal that something's wrong.
+    needs: [backend-tests, frontend-quality]
+    steps:
+      - uses: actions/checkout@v7
+
+      # Backend: builds from tracked source only (backend/, data/threat_intel/,
+      # pyproject.toml, uv.lock). No CYBER_AI_* secrets, dataset, model, or Chroma
+      # store are needed to BUILD the image -- those are only required at `docker
+      # run`, which this job deliberately never does. See README "CI/CD".
+      - run: docker build -t cyber-ai-backend .
+
+      # Frontend: builds from tracked source only. The backend URL is resolved at
+      # container *start* (see frontend/docker-entrypoint.sh), not baked in at
+      # build time, so no VITE_API_URL or other config is needed here either.
+      - run: docker build -t cyber-ai-frontend ./frontend
