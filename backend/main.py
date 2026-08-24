@@ -1,10 +1,14 @@
 import logging
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
-from backend.models.schemas import AnalyzeRequest, ThreatAnalysis
-from backend.rag.retrieval import vector_store_available
+from backend.models.schemas import AnalyzeRequest, HealthResponse, ThreatAnalysis, ThreatCategory
+from backend.rag.config import COLLECTION_NAME
+from backend.rag.retrieval import vector_store_available, vector_store_chunk_count
+from backend.services.knowledge_base import list_threat_categories
 from backend.services.llm import LLMResponseError, LLMUnavailableError
+from backend.services.llm_status import check_llm_status
 from backend.services.threat_analysis import VectorStoreUnavailableError, analyze_query
 
 logging.basicConfig(level=logging.INFO)
@@ -12,18 +16,38 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Cyber AI Platform")
 
+# Explicit dev origin for the Vite frontend (Step 12: no wildcard).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+
 
 @app.get("/")
 def home():
     return {"message": "Cyber AI Platform Running"}
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "vector_store_available": vector_store_available(),
-    }
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    """Reports API/vector-store/LLM status. Does not run any LLM inference."""
+    return HealthResponse(
+        status="ok",
+        vector_store=dict(
+            available=vector_store_available(),
+            chunk_count=vector_store_chunk_count(),
+            collection=COLLECTION_NAME,
+        ),
+        llm=check_llm_status(),
+    )
+
+
+@app.get("/threats", response_model=list[ThreatCategory])
+def threats() -> list[ThreatCategory]:
+    """Threat categories actually present in data/threat_intel/, for the frontend."""
+    return list_threat_categories()
 
 
 @app.post("/analyze", response_model=ThreatAnalysis)

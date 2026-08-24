@@ -59,6 +59,33 @@ class LLMAnalysisFragment(BaseModel):
     )
 
 
+class ThreatCategory(BaseModel):
+    """A threat type available in the local knowledge base, discovered from
+    data/threat_intel/*.txt -- not a curated or fabricated list."""
+
+    threat_type: str
+    source: str
+    description: str
+
+
+class VectorStoreStatus(BaseModel):
+    available: bool
+    chunk_count: int
+    collection: str
+
+
+class LLMStatus(BaseModel):
+    model: str
+    reachable: bool
+    model_pulled: bool
+
+
+class HealthResponse(BaseModel):
+    status: str
+    vector_store: VectorStoreStatus
+    llm: LLMStatus
+
+
 class ThreatAnalysis(BaseModel):
     """The /analyze response."""
 

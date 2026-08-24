@@ -32,6 +32,16 @@ def vector_store_available() -> bool:
         return False
 
 
+def vector_store_chunk_count() -> int:
+    """Number of chunks currently persisted, or 0 if the store doesn't exist yet."""
+    if not CHROMA_PERSIST_DIR.exists():
+        return 0
+    try:
+        return len(get_vector_store().get().get("ids", []))
+    except Exception:
+        return 0
+
+
 def retrieve_relevant(
     query: str,
     k: int = RAG_TOP_K,

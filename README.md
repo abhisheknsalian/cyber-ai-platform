@@ -1,20 +1,21 @@
 # Cyber AI Platform
 
-A local, retrieval-augmented cybersecurity threat-intelligence analysis service. It embeds a
-small knowledge base of threat write-ups (`data/threat_intel/*.txt`) into a Chroma vector store
-and uses a locally-running Llama 3.2 model (via [Ollama](https://ollama.com)) to turn a natural
--language question into a **validated, structured JSON threat analysis** with source attribution.
-
-This is currently a backend-only service — there is no frontend yet.
+A local, retrieval-augmented cybersecurity threat-intelligence analysis platform: a React
+dashboard backed by a FastAPI service. The backend embeds a small knowledge base of threat
+write-ups (`data/threat_intel/*.txt`) into a Chroma vector store and uses a locally-running
+Llama 3.2 model (via [Ollama](https://ollama.com)) to turn a natural-language question into a
+**validated, structured JSON threat analysis** with source attribution.
 
 ## Architecture
 
 ```text
-User Query (POST /analyze)
+React dashboard (Vite + TypeScript + Tailwind)
+   → FastAPI (POST /analyze, GET /health, GET /threats)
    → relevance-filtered retrieval (ChromaDB + HuggingFace embeddings)
    → deterministic threat-type identification + MITRE ATT&CK extraction (from source docs)
    → structured LLM generation (Ollama / Llama 3.2, JSON-schema constrained)
    → validated Pydantic response with source attribution
+   → React
 ```
 
 Out-of-domain or unsupported queries never reach the LLM at all: if nothing in the knowledge
@@ -25,16 +26,33 @@ retrieval layer. See **Relevance Filtering** below.
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
+- Node.js 20+ and npm (for the frontend)
 - [Ollama](https://ollama.com), installed and running locally
 
-## Installation
+## Running the Project
+
+### Backend
 
 ```bash
 uv sync
+uv run python -m backend.rag.ingestion   # build the vector store (see below)
+uv run uvicorn backend.main:app --reload
 ```
 
-This installs FastAPI, LangChain, ChromaDB, sentence-transformers, the Ollama client, pytest,
-and the existing notebook/ML dependencies into a local `.venv`.
+`uv sync` installs FastAPI, LangChain, ChromaDB, sentence-transformers, the Ollama client,
+pytest, and the existing notebook/ML dependencies into a local `.venv`.
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+cp .env.example .env   # only needed if the backend isn't on the default http://localhost:8000
+npm run dev
+```
+
+Opens at `http://localhost:5173`. It talks to the backend at the URL in `VITE_API_URL` (see
+**Frontend** below).
 
 ## Ollama
 
@@ -65,16 +83,26 @@ fresh Chroma collection to `rag/chroma_db/` (also gitignored). Each run wipes an
 collection from scratch, so it's safe to re-run any time the source documents change — it never
 accumulates stale or duplicate chunks.
 
-## Start the API
-
-```bash
-uv run uvicorn backend.main:app --reload
-```
+## Backend Endpoints
 
 - `GET /` — basic liveness message
-- `GET /health` — reports API status and whether the vector store has been built (does not call the LLM)
+- `GET /health` — API/vector-store/LLM status (does not run LLM inference — see below)
+- `GET /threats` — threat categories discovered from `data/threat_intel/*.txt`, for the frontend
 - `POST /analyze` — structured, retrieval-grounded threat analysis
 - `GET /docs` — interactive Swagger UI
+
+`GET /health` response:
+
+```json
+{
+  "status": "ok",
+  "vector_store": { "available": true, "chunk_count": 14, "collection": "threat_intel" },
+  "llm": { "model": "llama3.2:3b", "reachable": true, "model_pulled": true }
+}
+```
+
+`llm.reachable`/`model_pulled` come from listing installed Ollama models (`ollama.list()`) — this
+is a status check, not a generation call, so `/health` still never invokes the LLM.
 
 ## API Contract
 
@@ -198,6 +226,36 @@ significantly.
   database** — techniques not present in these five files (including sub-techniques, tactics, or
   related groups/software) simply won't appear, no matter what's asked.
 
+## Frontend
+
+`frontend/` is a React + TypeScript dashboard built with Vite and styled with Tailwind CSS —
+a dark, SOC-style interface for the API above. No other UI framework is used; components are
+hand-built with Tailwind.
+
+- **Dashboard** (`/`) — live `GET /health` + `GET /threats` data: knowledge-base size, supported
+  threat types, RAG status (vector store available + chunk count), LLM status (model reachable /
+  pulled). No fabricated metrics — anything not knowable from the API is shown as unavailable.
+- **Threat Analysis** (`/analyze`) — the query form, sample-query chips, loading state, and the
+  full structured result: threat/severity, attack vectors, indicators, MITRE ATT&CK (each
+  technique links to its real `attack.mitre.org` page), mitigations, and sources with relevance
+  scores. A `no_relevant_intelligence` response renders as a distinct empty state, never a
+  fabricated report.
+- **Threat Intelligence** (`/intelligence`) — the threat categories from `GET /threats`, i.e.
+  exactly what's in `data/threat_intel/`.
+- **About** (`/about`) — architecture explanation; states plainly what is and isn't implemented.
+
+**API integration**: `frontend/src/services/api.ts` is the only place that calls `fetch`;
+`analyzeThreat`/`getHealth`/`getThreats` are typed against `frontend/src/types/api.ts`, which
+mirrors `backend/models/schemas.py` field-for-field. Requests time out after 60s. Every failure
+mode (backend unreachable, timeout, non-2xx, malformed JSON) is normalized into a single
+`ApiError` with a user-facing message — no raw errors or stack traces reach the UI.
+
+**Configuration**: the backend URL is read from `VITE_API_URL` (see `frontend/.env.example`),
+defaulting to `http://localhost:8000` if unset. Never commit `frontend/.env`.
+
+**CORS**: the backend explicitly allows `http://localhost:5173` (the Vite dev server) via
+`CORSMiddleware` in `backend/main.py` — not a wildcard.
+
 ## Configuration
 
 All settings have sane local defaults and can be overridden with environment variables:
@@ -237,7 +295,7 @@ Covered:
 
 ```text
 backend/
-    main.py               # FastAPI app: /, /health, /analyze
+    main.py               # FastAPI app: /, /health, /threats, /analyze
     models/
         schemas.py         # Pydantic request/response models
     rag/
@@ -247,10 +305,24 @@ backend/
         retrieval.py           # loads the store, relevance-filtered similarity search
     services/
         llm.py               # Ollama call + structured JSON-schema output + parsing
+        llm_status.py         # lightweight Ollama reachability check for /health
+        knowledge_base.py     # discovers threat categories for /threats
         threat_analysis.py    # orchestrates retrieval -> MITRE extraction -> LLM -> response
 data/threat_intel/         # source threat-intelligence documents
 notebooks/                 # exploratory notebooks (DDoS classifier, RAG pipeline walkthrough)
 tests/                      # pytest suite (retrieval + API)
+frontend/
+    src/
+        types/api.ts         # TypeScript types mirroring backend/models/schemas.py
+        services/api.ts       # the only fetch() call site; typed, error-normalized
+        hooks/                 # useHealth, useThreats
+        components/
+            layout/              # AppShell, Sidebar
+            common/               # Card, PageHeader, SeverityBadge, StatusPill
+            dashboard/            # StatCard
+            analysis/             # QueryInput, SampleQueries, LoadingState, AnalysisResult, ...
+        pages/                  # DashboardPage, ThreatAnalysisPage, ThreatIntelligencePage, AboutPage
+        App.tsx                 # router
 ```
 
 ## Known Limitations
@@ -269,4 +341,9 @@ tests/                      # pytest suite (retrieval + API)
   knowledge base; it should be re-validated if the corpus grows.
 - The Random Forest DDoS traffic classifier in `notebooks/01_data_exploration.ipynb` is a
   separate, unintegrated experiment — it is not wired into `/analyze`.
-- There is no authentication, rate limiting, or frontend yet.
+- There is no authentication, rate limiting, live threat feeds, or Docker/deployment setup yet.
+- The frontend was verified visually at desktop width (~1440px) and functionally end-to-end
+  against the real backend + Ollama. Narrower breakpoints (tablet/mobile) are implemented with
+  standard Tailwind responsive classes (sidebar collapses to a top bar below `lg`, card grids
+  reflow via `sm`/`xl` columns) but were not independently confirmed by resizing a real browser
+  viewport in this environment.
