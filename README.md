@@ -534,6 +534,7 @@ tracked in git and contain nothing sensitive).
 | `CYBER_AI_USERNAME` / `CYBER_AI_PASSWORD` | Yes, for browser/session auth | See **Authentication** |
 | `OLLAMA_HOST` | Yes | Where Ollama is reachable from inside the container — see below |
 | `OLLAMA_MODEL` | No (defaults to `llama3.2:3b`) | Passed through unchanged |
+| `CORS_ORIGINS` | No (defaults to `http://localhost:5173`) | Comma-separated list of allowed browser origins — see **Docker Compose** below for why the Dockerized frontend needs this changed |
 | Everything in **Configuration** above | No | Same env vars, same defaults, work identically in the container |
 
 ### Required volume mounts
@@ -630,23 +631,168 @@ curl -X POST http://localhost:8000/classify \
 
 ### Known limitations
 
-- No `docker-compose.yml` yet (explicitly out of scope for this phase) — the model volume, Chroma
-  volume, and Ollama connection all have to be wired up by hand with `docker run` flags, as above.
+- For running the backend together with the Dockerized frontend, see **Docker Compose** below —
+  wiring both up by hand with `docker run` (as shown here) still works, but Compose is simpler.
 - The full `pyproject.toml` dependency set is installed as-is (per this phase's scope: no second
   dependency list, no splitting into extras) — this includes notebook-only packages (`jupyter`,
   `matplotlib`, `ipykernel`) and `torch` (pulled in by `sentence-transformers`) that the API itself
   never uses, making the image far larger than a trimmed backend-only dependency set would be.
   Splitting `pyproject.toml` into optional-dependency groups is a reasonable follow-up but wasn't
-  done here to stay in scope.
+  done here to stay in scope. Deliberately not optimized in Phase 6.3 either — see **Docker
+  Compose** > "Image sizes".
 - No persistent Hugging Face cache volume — the embedding model is re-downloaded from the internet
   on every fresh container start (see "Providing the Chroma vector store" above).
 - Sessions (Phase 5.2) are in-memory in the FastAPI process, same as local dev: restarting the
   container logs everyone out. Unaffected by containerization, just worth restating here.
-- Frontend↔container browser verification (login/session cookies against a *containerized*
-  backend from an actual browser) was not performed in this phase — the frontend isn't
-  containerized yet. This is planned for Phase 6.3. What *was* verified here is that the
-  container's auth behavior (API-key 401/200, public endpoints) is identical to local dev via
-  direct HTTP requests.
+
+## Docker Compose
+
+Phase 6.2 (frontend) and 6.3 (Compose) build on **Docker Backend** above: a second image for the
+React frontend, and a `docker-compose.yml` that wires both together. Ollama is deliberately **not**
+a Compose service — it keeps running on the host exactly as in every other phase and local dev
+(see **Docker Backend** > "Connecting to Ollama" for why).
+
+### Frontend image
+
+```bash
+docker build -t cyber-ai-frontend -f frontend/Dockerfile frontend
+```
+
+Two stages: a `node:22-alpine` builder runs `npm ci` (installs exactly what `package-lock.json`
+pins) then the existing, unmodified `npm run build`; the runtime stage is `nginx:1.27-alpine`
+serving only the static build output — no Node.js, no source files, no dev tooling. `nginx.conf`
+does one thing: serve static files, with `try_files $uri $uri/ /index.html;` as a fallback so
+client-side routes (`/analyze`, `/detection`, `/intelligence`, `/about`, and any other
+`react-router-dom` route) work on direct navigation/refresh, not just via in-app links.
+
+**Runtime-configurable backend URL.** A Vite app normally bakes `VITE_API_URL` into the JS bundle
+at *build* time, which would mean a separate image per backend URL. Instead this image resolves
+the backend URL at *container start*: `frontend/config.template.js` is copied into the image
+alongside the build output, and `frontend/docker-entrypoint.sh` renders it into `config.js` (via
+`envsubst`, reading the `VITE_API_URL` environment variable) before starting nginx. `index.html`
+loads `config.js` before the app bundle, and `src/services/api.ts` reads
+`window.__APP_CONFIG__.VITE_API_URL` first, falling back to the build-time
+`import.meta.env.VITE_API_URL` (used by `npm run dev`/`npm run build` outside Docker) and then a
+hardcoded default. Net effect: the same built image works against any backend by changing one
+environment variable in `docker-compose.yml`, no rebuild required. `frontend/public/config.js` is
+the static local-dev fallback (`window.__APP_CONFIG__ = {}`) that Vite copies into `dist/` as-is;
+Docker overwrites it at container startup.
+
+### Networking
+
+The two containers share a Compose network (`cyber-ai-net`) for isolation, but **the browser talks
+to the backend directly** — nginx does not proxy API requests. This was a deliberate choice, not
+an oversight: Phase 5.2 already built and verified a complete cross-origin auth flow (CORS
+allowlist, `SameSite=None` + `Secure` session cookie, double-submit CSRF cookie), and reusing it
+unchanged is simpler and less risky than adding a reverse-proxy layer merely to make the two
+containers appear same-origin.
+
+The consequence: the backend's port **must** be published to the host (`8000:8000`), because
+`VITE_API_URL` has to be a URL the *browser* (running on the host) can reach — `http://
+localhost:8000`, never the Compose service name `http://backend:8000`, which only resolves between
+containers on the Docker network, not from the host or the browser. This is the single most common
+mistake when Dockerizing a frontend+backend pair together, so it's called out explicitly here.
+
+By default:
+- Backend: `http://localhost:8000` (published; also used directly by non-browser API-key clients)
+- Frontend: `http://localhost:8080` (nginx, published)
+
+### CORS reconfiguration
+
+This is the one required backend code change in this phase: `CORS_ORIGINS` (`backend/main.py`) is
+now a comma-separated environment variable instead of a hardcoded single origin, defaulting to
+`http://localhost:5173` (the Vite dev server) so **local dev behavior is completely unchanged**.
+`docker-compose.yml` sets it to `http://localhost:5173,http://localhost:8080`, adding the
+Dockerized frontend's origin without removing the dev one. No wildcard origins, no wildcard
+credentials, and `allow_credentials=True` continues to pair only with an explicit, non-wildcard
+allowlist — the same constraint Phase 3 established.
+
+### Volumes
+
+Same two mounts, and the same reasoning, as **Docker Backend** above:
+
+| Path | Mode | Why |
+|---|---|---|
+| `./models:/app/models` | `:ro` | `joblib.load()` only reads it |
+| `./rag/chroma_db:/app/rag/chroma_db` | Read-write | Chroma's SQLite backend needs to write WAL/journal files even for read-only queries (Phase 6.1 finding) — mounting `:ro` breaks every `/analyze` request |
+
+`data/threat_intel/` is **not** a volume — it's baked into the backend image (see **Docker
+Backend** > "Build") because `backend/services/knowledge_base.py` reads it at request time, not
+just at ingestion time.
+
+### Configuration
+
+```bash
+cp .env.example .env
+# edit .env with real values -- it is gitignored and must never be committed
+docker compose up -d --build
+```
+
+`.env.example` documents every variable Compose reads (`CYBER_AI_API_KEY`, `CYBER_AI_USERNAME`,
+`CYBER_AI_PASSWORD`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `CORS_ORIGINS`, `VITE_API_URL`) with placeholder
+values only. `docker-compose.yml` fails fast (`${VAR:?...}` syntax) if the three auth variables
+aren't set, rather than silently starting an effectively-unauthenticated backend.
+
+### Health checks
+
+Both services define a Compose `healthcheck`; `frontend` uses `depends_on: backend: condition:
+service_healthy`, so `docker compose up` brings the backend up first. The frontend's healthcheck
+(`wget --spider http://127.0.0.1/`) only proves nginx is serving `index.html` — it says nothing
+about the backend, Ollama, or the vector store, since nginx never talks to any of them. It targets
+`127.0.0.1` explicitly, not `localhost`: the container's `/etc/hosts` resolves `localhost` to
+`::1` first, but `nginx.conf` only binds IPv4 (`listen 80;`), so `wget http://localhost/` fails
+with "Connection refused" even though the server is up — found live while verifying this phase.
+
+### Testing / live verification performed
+
+- `docker compose config` validates the file; `docker compose up -d --build` brings up both
+  containers; both reach and stay `healthy`.
+- Browser: loaded `http://localhost:8080`, logged in (`POST /auth/login` succeeds cross-origin,
+  `8080` → `8000`, session + CSRF cookies set), landed on the Dashboard with live RAG/LLM status.
+- Threat Analysis: submitted "How can DDoS attacks be mitigated?" through the browser against the
+  Dockerized backend — real Ollama call, correct `DDOS_ATTACK`/High severity classification, MITRE
+  `T1498` (Network Denial of Service), and source attribution to `ddos_attack.txt`.
+- Network Detection: the all-zero example classified `BENIGN` (LLM correctly skipped). Separately,
+  a real labeled `DDoS` row from the CICIDS2017 dataset was classified via `POST /classify`
+  (`prediction: DDoS`, `probability: 1.0`) and chained through `POST /analyze/classification`,
+  producing the same MITRE `T1498` report — verifying the full classifier→RAG chain runs correctly
+  against the Compose-networked backend.
+- Logged out via the browser; confirmed the app drops back to the login gate.
+- Direct API-key access to the published backend port still works independently of the browser
+  session (`Authorization: Bearer <CYBER_AI_API_KEY>` against `http://localhost:8000`).
+- Security: missing/invalid API key → `401` on protected endpoints; public endpoints (`/`,
+  `/health`, `/threats`, `/auth/me`) remain reachable with no credentials; a CORS preflight from an
+  origin *not* in `CORS_ORIGINS` (`http://evil.example.com`) is rejected (`400`, no
+  `Access-Control-Allow-Origin` header); a preflight from `http://localhost:8080` is allowed.
+- Confirmed the built frontend JS bundle contains no backend secrets, API keys, or passwords
+  (`grep` over `frontend/dist/assets/*.js`).
+- A project-wide scan for AI-tool branding/attribution strings (source tree, `frontend/dist/`, and
+  both built images' filesystems via `docker run --entrypoint sh ... grep -r`) came back clean.
+
+### Image sizes
+
+| Image | Size |
+|---|---|
+| `cyber-ai-backend` | ~6.55 GB (unchanged from Phase 6.1 — deliberately not optimized in this phase; see **Docker Backend** > "Known limitations") |
+| `cyber-ai-frontend` | ~23 MB (`node:22-alpine` builder is discarded; final image is `nginx:1.27-alpine` + a ~285 KB static build) |
+
+Measured with `docker image inspect <image> --format='{{.Size}}'` (actual on-disk content size,
+not `docker images`' larger, misleading "disk usage" column — see **Docker Backend** for the same
+caveat).
+
+### Known limitations
+
+- No CI/build pipeline runs any of this automatically (out of scope — see **Known Limitations**
+  below).
+- No HTTPS/TLS termination for either container; both are plain HTTP, matching every prior phase's
+  local-first, localhost-only scope. `Secure` cookies still work because modern browsers treat
+  `http://localhost` as a trustworthy origin for that purpose.
+- nginx's master process starts as root (standard nginx behavior, needed to bind port 80); its
+  worker processes — the ones that actually handle connections — drop to the unprivileged `nginx`
+  user built into the base image. This is normal, industry-standard nginx behavior, not a gap
+  specific to this image.
+- The backend's port is published to the host because the browser needs to reach it directly (see
+  **Networking** above) — this is structural to the chosen architecture, not an oversight.
 
 ## Testing
 
@@ -731,6 +877,16 @@ frontend/
             analysis/             # QueryInput, SampleQueries, LoadingState, AnalysisResult, ...
         pages/                  # LoginPage, DashboardPage, ThreatAnalysisPage, NetworkDetectionPage, ThreatIntelligencePage, AboutPage
         App.tsx                 # router + auth gate
+    public/config.js            # local-dev runtime-config fallback (window.__APP_CONFIG__ = {})
+    config.template.js          # Docker-only: envsubst template for the same config.js
+    docker-entrypoint.sh        # Docker-only: renders config.js from VITE_API_URL, then starts nginx
+    nginx.conf                  # Docker-only: static SPA server, no API proxying
+    Dockerfile                  # Docker-only: node builder -> nginx:alpine runtime
+    .dockerignore
+Dockerfile                      # backend image (see Docker Backend)
+.dockerignore
+docker-compose.yml               # wires the backend + frontend images together (see Docker Compose)
+.env.example                     # placeholder values for docker-compose.yml (copy to .env, gitignored)
 ```
 
 ## Known Limitations
@@ -747,7 +903,7 @@ frontend/
   or two techniques per file) — it is not a general ATT&CK reference.
 - The relevance threshold (`RAG_SCORE_THRESHOLD=1.5`) was tuned against this specific 14-chunk
   knowledge base; it should be re-validated if the corpus grows.
-- There is no authentication, rate limiting, live threat feeds, or Docker/deployment setup yet.
+- There is no rate limiting or live threat feed integration.
 - The frontend was verified visually at desktop width (~1440px) and functionally end-to-end
   against the real backend + Ollama. Narrower breakpoints (tablet/mobile) are implemented with
   standard Tailwind responsive classes (sidebar collapses to a top bar below `lg`, card grids

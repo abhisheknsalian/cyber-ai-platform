@@ -1,0 +1,23 @@
+# Reinstalled inside the image by `npm ci`; never copy the host's copy in.
+node_modules
+
+# Rebuilt inside the image by `npm run build`; a stale host copy must never leak in.
+dist
+
+# Secrets / local env overrides -- never present in this repo, excluded defensively.
+.env
+.env.*
+!.env.example
+
+# Not needed inside the build context.
+.git
+.gitignore
+README.md
+.dockerignore
+Dockerfile*
+
+# Editor / OS files
+.vscode
+.DS_Store
+Thumbs.db
+*.log

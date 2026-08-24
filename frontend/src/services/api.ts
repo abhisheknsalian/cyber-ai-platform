@@ -8,7 +8,12 @@ import type {
   NetworkTrafficFeatures,
 } from "../types/ml";
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+// Resolution order: (1) window.__APP_CONFIG__, injected at container startup by
+// frontend/docker-entrypoint.sh from the VITE_API_URL environment variable -- this
+// is what lets one built Docker image point at different backend URLs without a
+// rebuild; (2) import.meta.env.VITE_API_URL, baked in at build time (used by
+// `npm run dev`/`npm run build` outside Docker); (3) the local-dev default.
+const API_URL = window.__APP_CONFIG__?.VITE_API_URL || import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 const REQUEST_TIMEOUT_MS = 60_000;
 

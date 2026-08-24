@@ -60,14 +60,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Cyber AI Platform", lifespan=lifespan)
 
-# Explicit dev origin for the Vite frontend (Step 12 in Phase 3: no wildcard).
+# Explicit origin allowlist (Step 12 in Phase 3: no wildcard) -- configurable via
+# CORS_ORIGINS (comma-separated) so the Dockerized frontend's origin (e.g.
+# http://localhost:8080, see docker-compose.yml) can be added without a code change,
+# while the default preserves the exact Phase 3/5.2 local-dev behavior unchanged.
 # allow_credentials=True is required for the browser to send/receive the session +
-# CSRF cookies cross-origin (the frontend and backend run on different localhost
-# ports); it's only safe to combine with a wildcard-free, exact allow_origins list,
-# which this already is.
+# CSRF cookies cross-origin; it's only safe to combine with a wildcard-free, exact
+# allow_origins list, which this always is regardless of how CORS_ORIGINS is set.
+_cors_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "Authorization", "X-CSRF-Token"],

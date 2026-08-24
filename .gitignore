@@ -28,3 +28,9 @@ Thumbs.db
 .vscode/
 
 data/raw/
+
+# docker-compose.yml reads a root .env by convention (never committed; see
+# .env.example for the placeholder template).
+.env
+.env.*
+!.env.example

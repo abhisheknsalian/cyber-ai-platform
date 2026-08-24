@@ -1,0 +1,78 @@
+# Phase 6.3: wires the Phase 6.1 backend image and the Phase 6.2 frontend image
+# together. Ollama is intentionally NOT a service here -- it keeps running on the
+# host exactly as in every prior phase (see README "Docker Backend" /
+# "Docker Compose" sections for why: it is a large, GPU-capable, host-installed
+# service that both this stack and non-Dockerized local dev share unchanged).
+#
+# Networking model (see README "Docker Compose" > "Networking" for the full
+# rationale): the browser talks to the backend DIRECTLY on its published port, not
+# through the frontend's nginx. This reuses the existing Phase 5.2 cross-origin
+# cookie + CSRF architecture completely unchanged -- no proxy was added "merely for
+# convenience." The `cyber-ai-net` network below is still declared explicitly for
+# service isolation and DNS between the two containers, even though the browser's own
+# requests to the backend do not traverse it.
+#
+# All backend secrets/config come from environment variables substituted from a root
+# .env file (never committed -- see .env.example for the placeholder template).
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cyber-ai-backend
+    ports:
+      - "8000:8000"
+    environment:
+      CYBER_AI_API_KEY: ${CYBER_AI_API_KEY:?Set CYBER_AI_API_KEY in .env (see .env.example)}
+      CYBER_AI_USERNAME: ${CYBER_AI_USERNAME:?Set CYBER_AI_USERNAME in .env (see .env.example)}
+      CYBER_AI_PASSWORD: ${CYBER_AI_PASSWORD:?Set CYBER_AI_PASSWORD in .env (see .env.example)}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      # Includes both the Vite dev-server origin (so a non-Dockerized frontend can
+      # still reach a Dockerized backend during development) and the default
+      # published nginx origin below. Override in .env if either port is changed.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8080}
+    volumes:
+      # Read-only: the backend only ever calls joblib.load() on this artifact.
+      - ./models:/app/models:ro
+      # NOT read-only -- Chroma's SQLite backend needs write access (WAL/journal
+      # files) even for read-only queries. Discovered and documented in Phase 6.1;
+      # mounting this :ro breaks every /analyze request with "attempt to write a
+      # readonly database".
+      - ./rag/chroma_db:/app/rag/chroma_db
+    extra_hosts:
+      # Docker Desktop (macOS/Windows) provides host.docker.internal automatically;
+      # this makes the same OLLAMA_HOST default also work on Linux.
+      - "host.docker.internal:host-gateway"
+    networks:
+      - cyber-ai-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: cyber-ai-frontend
+    ports:
+      - "8080:80"
+    environment:
+      # Must be reachable from the BROWSER (running on the host), not from inside the
+      # frontend container -- so this is the backend's host-published port
+      # (http://localhost:8000), never the Compose service name (http://backend:8000,
+      # which only resolves on the Docker network between containers).
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    networks:
+      - cyber-ai-net
+    depends_on:
+      backend:
+        condition: service_healthy
+
+networks:
+  cyber-ai-net:
+    driver: bridge
