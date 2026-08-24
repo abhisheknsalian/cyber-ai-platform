@@ -1,73 +1,59 @@
-from fastapi import FastAPI
-import ollama
-import os
+import logging
 
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from fastapi import FastAPI, HTTPException
 
-app = FastAPI()
+from backend.models.schemas import AnalyzeRequest, ThreatAnalysis
+from backend.rag.retrieval import vector_store_available
+from backend.services.llm import LLMResponseError, LLMUnavailableError
+from backend.services.threat_analysis import VectorStoreUnavailableError, analyze_query
 
-# Base directory
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Chroma DB path
-CHROMA_PATH = os.path.join(BASE_DIR, "rag", "chroma_db")
+app = FastAPI(title="Cyber AI Platform")
 
-# Load embedding model
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
-
-# Load vector database
-vector_db = Chroma(
-    persist_directory=os.path.join(BASE_DIR, "rag", "multi_threat_db"),
-    embedding_function=embedding_model
-)
 
 @app.get("/")
 def home():
     return {"message": "Cyber AI Platform Running"}
 
-@app.post("/analyze")
-def analyze_threat(query: str):
 
-    # Retrieve relevant threat intelligence
-    results = vector_db.similarity_search(query, k=2)
-
-    context = "\n".join([doc.page_content for doc in results])
-
-    # AI Prompt
-    prompt = f"""
-    You are an expert cybersecurity analyst.
-
-    Use the threat intelligence context below to answer professionally.
-
-    Threat Intelligence Context:
-    {context}
-
-    User Query:
-    {query}
-
-    Generate:
-    1. Threat Summary
-    2. MITRE ATT&CK Mapping
-    3. Indicators
-    4. Mitigation Recommendations
-    """
-
-    # Send to Llama via Ollama
-    response = ollama.chat(
-        model="llama3.2:3b",
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    )
-
+@app.get("/health")
+def health():
     return {
-        "query": query,
-        "retrieved_context": context,
-        "analysis": response['message']['content']
+        "status": "ok",
+        "vector_store_available": vector_store_available(),
     }
+
+
+@app.post("/analyze", response_model=ThreatAnalysis)
+def analyze_threat(request: AnalyzeRequest) -> ThreatAnalysis:
+    try:
+        return analyze_query(request.query)
+    except VectorStoreUnavailableError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Vector store not found. Build it first with: "
+                "uv run python -m backend.rag.ingestion"
+            ),
+        )
+    except LLMUnavailableError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The local LLM (Ollama) is unavailable. Ensure 'ollama serve' is "
+                "running and the configured model has been pulled."
+            ),
+        )
+    except LLMResponseError:
+        raise HTTPException(
+            status_code=502,
+            detail="The LLM returned a response that could not be parsed into a valid analysis.",
+        )
+    except Exception:
+        logger.exception("Unexpected error while analyzing query: %r", request.query)
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while analyzing the query.",
+        )
