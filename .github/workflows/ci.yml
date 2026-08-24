@@ -29,7 +29,7 @@ jobs:
       # repeat installs across runs. No python-version input: uv reads the
       # project's own .python-version file automatically, so the Python version
       # used here always matches what the project actually declares.
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
 
