@@ -1359,6 +1359,14 @@ Covered:
   structurally, that a deliberately "hostile" mocked LLM fragment (fabricated indicators, a
   fabricated mitigation, a summary claiming a different prediction) can never reach the response in
   place of the real classifier/graph/source evidence
+- **Phase 11:** `backend/evaluation/` -- property-based assertions (confusion matrix dimensions,
+  probabilities summing to ~1, threshold/calibration values staying in valid ranges) rather than
+  exact-value checks against the synthetic fixture; the held-out-test/full-dataset split stays
+  disjoint and correctly sized; retrieval evaluation's negative control returns zero evidence while
+  the five real topic queries do not; the pipeline benchmark mocks the LLM call (same pattern as the
+  rest of this suite, no Ollama required) and structurally proves a hostile mocked LLM fragment
+  cannot leak into the JSON report, which has no field for arbitrary LLM text; the CLI's default
+  (no `--pipeline`) invocation is asserted to never call the LLM at all
 
 Frontend automated tests were not added in this phase (no test runner existed for `frontend/`
 before it, and adding one — e.g. Vitest + Testing Library — is a separate infrastructure decision
@@ -1366,6 +1374,86 @@ from browser auth integration). The login/logout/redirect flows were verified ma
 app signed out, confirm the login page renders, sign in, confirm the app renders and the session
 cookie is `HttpOnly` (unreadable from the browser console), sign out, confirm the login page
 returns.
+
+## Evaluation & Benchmarking
+
+`backend/evaluation/` is a read-only measurement layer over the pipeline already documented above
+— it never trains, retrains, or modifies the classifier, the real dataset, the vector store, or the
+threat graph. It only loads and measures what already exists, against the real local CICIDS2017
+CSV and the real trained model artifact (not the tests' synthetic fixture).
+
+```bash
+uv run python -m backend.evaluation                 # offline: ML + retrieval evaluation, no Ollama needed
+uv run python -m backend.evaluation --pipeline       # also runs the end-to-end pipeline benchmark (needs Ollama)
+uv run python -m backend.evaluation --output path.json
+```
+
+Requires the same local artifacts the rest of the README does: the real dataset at
+`data/raw/*.csv` (see "Getting the dataset"), a trained model (`uv run python -m backend.ml.train`),
+and a built vector store (`uv run python -m backend.rag.ingestion`) for the retrieval section. Any
+missing prerequisite degrades that one report section to `null` plus a plain-English reason in
+`limitations` — it never fabricates a substitute number. The report is written to
+`evaluation/latest.json` by default (gitignored, same pattern as `rag/chroma_db/`, `rag/graph/`,
+`models/` — reproducible on demand, not a committed artifact).
+
+**Held-out test vs. full-dataset metrics.** `backend/ml/train.py` does not persist the original
+train/test row indices, but it does persist a fixed `random_state`/`test_size`, and
+`train_test_split()` is deterministic given the same input rows in the same order. Re-running the
+identical split call therefore *reconstructs* the model's original test set rather than inventing a
+new one — verified, not just assumed: `held_out_test`'s row count is cross-checked against
+`models/*.metadata.json`'s `test_rows`, and in this environment the reconstructed accuracy
+(`0.9999103480736042`) matches the recorded value exactly. `held_out_test` is a true generalization
+estimate (rows the model never saw during training); `full_dataset` scores every cleaned row,
+**including rows the model was trained on**, and is reported only as a descriptive summary — never
+as a generalization claim. The two are kept in separate, clearly labeled sections of the report for
+exactly this reason.
+
+**Why 99.99% accuracy is not a general DDoS-detection claim.** The local dataset (CICIDS2017's
+Friday-afternoon capture) contains exactly two classes: `BENIGN` and `DDoS`. The near-perfect
+accuracy figures describe how separable *those two classes* are in *this capture* — they say
+nothing about performance on port scans, botnets, web attacks, brute force, infiltration, or any
+other traffic pattern this dataset simply doesn't contain. A classifier can score 99.99% on a
+binary, highly-separable problem while having no signal at all about traffic types outside its
+training distribution. Treat these numbers as "this model reliably tells DDoS from benign traffic
+in this dataset," not as "this model detects attacks."
+
+**Threshold and calibration analysis are evaluation-only.** `threshold_analysis()` sweeps the DDoS
+decision boundary from 0.10 to 0.90 and reports precision/recall/F1/FPR/FNR at each point,
+identifying the best-F1 threshold — but the production classifier's actual decision rule (argmax
+over `class_probabilities`, equivalent to an implicit 0.5 threshold) is never changed by this
+analysis; it's reported alongside the sweep for comparison only. `calibration_report()` computes
+Brier score and 10 reliability bins over the same held-out DDoS probabilities without recalibrating
+the model. Because the model is this confident, most predictions land in the two extreme bins
+([0.0–0.1] and [0.9–1.0]) with very few in between — a real, honestly-reported property of a
+near-perfect classifier on a highly separable dataset, not a bug in the bin computation.
+
+**Retrieval evaluation is coverage, not "accuracy."** `retrieval_evaluation.py` reuses the same five
+example queries already shown in the frontend's Threat Analysis page (one per real
+`data/threat_intel/*.txt` document — the same query↔topic pairing already established in
+**Relevance Filtering**), plus one deliberate off-topic negative control. It reports
+`topic_coverage_rate` (does vector retrieval's top hit match each query's known intended topic) and
+`hybrid_preserves_both_sources_rate` (does hybrid evidence retain both vector and graph evidence
+together), plus per-stage latency for vector/graph/hybrid retrieval. This is deliberately not called
+"retrieval accuracy" or "precision@k" — this repository has no independently-labeled relevance
+judgment set to compute either against; six queries is a coverage sanity check, not a benchmark
+corpus.
+
+**Pipeline benchmark** (`--pipeline` only) times each stage of the real `classify_and_analyze()` /
+`analyze_query()` path — classifier inference, vector retrieval, graph retrieval, hybrid retrieval,
+LLM analysis, and one true end-to-end call — against real DDoS rows from the local dataset. The
+per-stage numbers come from separate, isolated calls to the exact same functions the pipeline
+itself calls (to avoid instrumenting production code paths, which would risk changing their
+behavior), so they will not sum exactly to the end-to-end total; see the report's `pipeline.note`
+field for the precise accounting. A single discarded warm-up LLM call runs before timing starts, so
+Ollama's one-time model-load cost doesn't skew the first sample's latency.
+
+**What genuine multi-class evaluation would require.** Everything above is architecturally ready
+for more than two classes (see **Multi-class-ready architecture (Phase 10)**) but is evaluated only
+on what real data actually supports. A defensible multi-class benchmark would need additional real,
+labeled CICIDS2017 (or equivalent) capture files covering the other attack categories — port scans,
+botnets, web attacks, brute force, infiltration — added to `LABEL_MAP`, and the model retrained
+against the combined dataset before any multi-class accuracy claim could be made honestly. This
+evaluation layer does not download, fabricate, or simulate that data.
 
 ## Project Structure
 
@@ -1393,6 +1481,12 @@ backend/
         schemas.py             # dynamically-generated NetworkTrafficFeatures + classification schemas
         train.py                # uv run python -m backend.ml.train -- the only place the model is fit
         predictor.py             # loads the saved model; predict() + feature_importance()
+    evaluation/               # Phase 11: read-only evaluation/benchmarking layer -- see Evaluation & Benchmarking
+        schemas.py             # typed report structures (every section independently optional)
+        ml_evaluation.py         # held-out/full-dataset metrics, threshold analysis, calibration
+        retrieval_evaluation.py   # vector/graph/hybrid retrieval latency + topic coverage
+        benchmark.py               # end-to-end pipeline stage latency (needs Ollama)
+        __main__.py                 # uv run python -m backend.evaluation [--pipeline] [--output PATH]
     services/
         llm.py               # Ollama call + structured JSON-schema output + parsing
         llm_status.py         # lightweight Ollama reachability check for /health
@@ -1406,8 +1500,9 @@ data/threat_intel/         # source threat-intelligence documents
 data/raw/                   # CICIDS2017 CSV goes here (gitignored, not committed)
 models/                      # trained classifier artifact + metadata (gitignored, not committed)
 rag/graph/                    # persisted threat_graph.json (gitignored, Phase 9 -- see Rebuilding the graph)
+evaluation/                    # generated reports (gitignored, Phase 11 -- see Evaluation & Benchmarking)
 notebooks/                 # exploratory notebooks (DDoS classifier, RAG pipeline walkthrough)
-tests/                      # pytest suite (RAG + ML + auth + intelligence)
+tests/                      # pytest suite (RAG + ML + auth + intelligence + evaluation)
 frontend/
     src/
         types/api.ts, ml.ts, auth.ts, intelligence.ts   # TypeScript types mirroring the backend Pydantic models
