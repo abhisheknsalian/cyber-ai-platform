@@ -13,6 +13,50 @@ architecture covers TLS, container hardening, scaling limits, and failure behavi
 below for exactly what's implemented, what's designed-only, and what remains unverified — this
 README does not blur that line anywhere.
 
+## Why This Project
+
+**1. Evidence integrity.** Deterministic facts (classifier prediction, probability, MITRE ATT&CK
+technique IDs, source attribution) are kept structurally separate from LLM-generated narrative — the
+LLM's own output schema has no field for any of them, so it cannot override them even if prompted
+to. This is verified with hostile-input tests that feed the LLM a deliberately fabricated response
+and assert none of it reaches the API output (see **Threat Intelligence Graph** > "Evidence-first
+LLM").
+
+**2. Hybrid retrieval.** Threat analysis combines semantic vector retrieval (Chroma +
+sentence-transformers) with a deterministic, in-memory threat-intelligence graph built by parsing
+the same source documents — no LLM involved in graph construction. Graph-derived indicators and
+mitigations reach the response directly, without depending on LLM generation (see **Threat
+Intelligence Graph** > "Hybrid retrieval").
+
+**3. Evaluation and engineering rigor.** A dedicated, read-only evaluation layer produces held-out
+(not just full-dataset) classification metrics, threshold and calibration analysis, and a retrieval
+sanity benchmark — all reproducible on demand and never presented as more than they are (see **Key
+Results** below and **Evaluation & Benchmarking**). 285 automated backend tests cover this pipeline
+end to end, including a real CI-only regression that was diagnosed, root-caused, and fixed (see
+**Testing**).
+
+## Key Results
+
+The exact figures produced by `uv run python -m backend.evaluation` against the real local
+CICIDS2017 dataset and trained model in this development environment — not rounded differently from
+the full-precision values in **Evaluation & Benchmarking** below, which is the canonical source.
+
+| Area | Result |
+|---|---:|
+| Held-out accuracy | 99.991% |
+| Macro F1 | 99.991% |
+| ROC-AUC | 0.99999985 |
+| PR-AUC | 0.99999988 |
+| Automated backend tests | 285 |
+| Threat graph | 60 entities / 55 relationships |
+| LLM analysis latency | ~2.6–2.7s |
+
+**ML metrics are specific to the local CICIDS2017 Friday-afternoon binary BENIGN/DDoS dataset and
+are not a general-purpose DDoS detection claim. Retrieval results (topic coverage 1.0, hybrid
+evidence preservation 1.0 — see below) are from a six-query sanity benchmark, not a formal IR
+benchmark.** See **Evaluation & Benchmarking** for the full results table, methodology, and every
+caveat in detail.
+
 ## Key Capabilities
 
 | Area | Capability |
@@ -26,6 +70,27 @@ README does not blur that line anywhere.
 | Operational hardening | Rate limiting, request IDs, structured JSON logging, security headers, health/readiness separation (see **Observability & Operations**) |
 | Evaluation | Reproducible held-out/full-dataset metrics, threshold and calibration analysis, retrieval coverage benchmark, per-stage pipeline latency (see **Evaluation & Benchmarking**) |
 | Deployment architecture | Hardened Docker images, a production Compose profile, and a documented (not deployed) single-VM + reverse-proxy architecture (see **Production Deployment Architecture**) |
+
+## Screenshots
+
+Real captures from a local run against the real backend, real trained classifier, and real Ollama
+model — not mockups.
+
+**Threat Analysis** — a real `/analyze` query ("How can DDoS attacks be mitigated?"), showing the
+deterministic MITRE ATT&CK technique, graph-derived mitigations, and source attribution alongside
+the LLM-generated narrative:
+
+![Threat Analysis page showing a DDoS attack analysis with severity, MITRE ATT&CK technique T1498, indicators, mitigations, and source attribution](docs/screenshots/threat-analysis.jpg)
+
+**Network Detection** — the Random Forest classifier scoring a CICFlowMeter-style feature vector
+(the all-zero example shape, not real captured traffic):
+
+![Network Detection page showing a BENIGN classification result with 84% probability from the random_forest model](docs/screenshots/network-detection.jpg)
+
+**Threat Intelligence graph** — the deterministic, one-hop relationship graph for one threat entity,
+rendered as a radial node-link diagram (plain SVG, no charting library):
+
+![Threat Intelligence graph view showing the DDoS Attack entity with its technique, indicator, mitigation, and source relationships](docs/screenshots/threat-intelligence-graph.png)
 
 ## Architecture
 
@@ -71,6 +136,58 @@ relevant, the API returns a `no_relevant_intelligence` result directly from the 
 
 For the deployment-level view (containers, networks, trust boundaries, what's public vs. private),
 see **Production Deployment Architecture** > "Architecture diagram" further down.
+
+## Quick Start
+
+One linear path to a running system. Every command below is the exact command already documented in
+its own section further down (**Requirements**, **Running the Project**, **Ollama**, **Build the
+Vector Database**, **Authentication**) — this just orders them into a single sequence.
+
+```bash
+# 1. Clone
+git clone https://github.com/abhisheknsalian/cyber-ai-platform.git
+cd cyber-ai-platform
+
+# 2. Install dependencies
+uv sync
+cd frontend && npm install && cd ..
+
+# 3. Configure environment (local values only -- never commit real secrets)
+export CYBER_AI_USERNAME="choose-your-own-local-username"
+export CYBER_AI_PASSWORD="choose-your-own-local-password"
+export CYBER_AI_API_KEY="choose-your-own-local-value"      # only needed for direct API (non-browser) clients
+
+# 4. Start Ollama (separate terminal, or already running as a service)
+ollama serve
+ollama pull llama3.2:3b
+
+# 5. Build the vector database (from the tracked data/threat_intel/ documents)
+uv run python -m backend.rag.ingestion
+
+# 6. Start the backend
+uv run uvicorn backend.main:app --reload
+
+# 7. Start the frontend (separate terminal)
+cd frontend && npm run dev
+
+# 8. Open the browser
+open http://localhost:5173
+```
+
+**What works immediately from a fresh clone:** the full RAG pipeline (Threat Analysis, Threat
+Intelligence), login/session auth, and all 285 automated tests (`uv run pytest tests/ -v`) — none of
+these need the trained classifier or the real dataset.
+
+**9. Optional — the DDoS classifier.** `POST /classify` and the Network Detection page return `503`
+until a model is trained, because **neither the trained model nor the real dataset is committed to
+this repository** (both are gitignored, matching the pattern used for every other generated
+artifact — see **Reproducibility**). Training requires the real CICIDS2017 CSV, which is gated
+behind a registration form at cicresearch.ca, not a plain download — see **Getting the dataset**.
+Once obtained and placed at `data/raw/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv`:
+
+```bash
+uv run python -m backend.ml.train
+```
 
 ## Requirements
 
@@ -776,13 +893,9 @@ startup log ever prints a secret's actual value, only whether it's configured.
 
 ## Authentication
 
-`POST /analyze`, `POST /classify`, `GET /ml/feature-importance`, `POST /analyze/classification`, and
-`POST /intelligence/search` (Phase 9) require authentication. `GET /`, `GET /health`, `GET /ready`,
-`GET /threats`, `GET /intelligence/entities`, `GET /intelligence/graph/{threat_id}`, and
-`GET`/`POST /auth/*` stay public (though `POST /auth/login` and four of the five protected endpoints
-above are rate-limited — see **Observability & Operations** > "Rate limiting" for exactly which one
-isn't and why). There are two independent credential paths, either of which satisfies a protected
-request:
+See **Backend Endpoints** above for exactly which endpoints require authentication and which are
+public — this section covers *how* the two credential paths work, not which endpoints use them.
+There are two independent credential paths, either of which satisfies a protected request:
 
 ```text
 Direct API client:  Authorization: Bearer <CYBER_AI_API_KEY>  ─┐
@@ -954,9 +1067,8 @@ channel the generic "Invalid username or password" error already closes. Exceedi
 `429` with a `Retry-After` header and a generic message; the response body never reveals hit counts
 or any other client's state. `GET /ml/feature-importance` requires authentication (see **Authentication**) but, verified against
 `backend/main.py`, is not wired to this rate limiter -- unlike the four endpoints above, it neither
-retrieves nor runs the model, only reads its already-computed `feature_importances_`.
-Public endpoints (`/`, `/health`, `/ready`, `/threats`, `GET /auth/me`, `POST /auth/logout`,
-`GET /intelligence/entities`, `GET /intelligence/graph/{threat_id}`) are never rate-limited.
+retrieves nor runs the model, only reads its already-computed `feature_importances_`. Every public
+endpoint (see **Backend Endpoints**) is never rate-limited.
 
 No account lockout was added deliberately: a lockout that a remote, unauthenticated caller can
 trigger by attempting a known username with wrong passwords is itself a denial-of-service vector
@@ -2088,7 +2200,12 @@ frontend/
 Dockerfile                      # backend image (see Docker Backend)
 .dockerignore
 docker-compose.yml               # wires the backend + frontend images together (see Docker Compose)
+docker-compose.prod.yml           # additive production Compose profile (see Production Deployment Architecture)
 .env.example                     # placeholder values for docker-compose.yml (copy to .env, gitignored)
+.env.prod.example                 # placeholder values for docker-compose.prod.yml (copy to .env.prod, gitignored)
+deploy/nginx/                      # example reverse-proxy config (not wired into any Compose file -- see TLS / Ingress)
+RELEASE_NOTES.md                    # capability summary by subsystem, not a commit log
+docs/screenshots/                    # real screenshots referenced above
 ```
 
 ## Final Limitations Summary
