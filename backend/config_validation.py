@@ -48,6 +48,37 @@ def _check_cors_origins() -> None:
             )
 
 
+# The exact placeholder strings from .env.example. Deploying with one of these
+# unchanged is a real, common production incident (default/example credentials left
+# in place) -- worth a loud, specific warning. This is not a secret-value comparison
+# leak: these three strings are already public, committed, documented placeholders,
+# not anything drawn from a real deployment's configuration.
+_PLACEHOLDER_VALUES = {
+    "CYBER_AI_API_KEY": "changeme-generate-a-long-random-value",
+    "CYBER_AI_USERNAME": "changeme",
+    "CYBER_AI_PASSWORD": "changeme-use-a-strong-password",
+}
+
+
+def _check_placeholder_credentials() -> None:
+    """Warns (does not fail startup) if a credential is still set to .env.example's
+    literal placeholder value. A warning, not a ConfigurationError, for the same
+    reason a missing credential isn't fatal (see validate_startup_config()'s
+    docstring): this module has no way to distinguish "local dev, deliberately using
+    a placeholder to get started" from "production, forgot to change it" without a
+    concept of environment this project doesn't otherwise need. The warning is loud
+    and specific so it's impossible to miss in aggregated production logs."""
+    for env_var, placeholder in _PLACEHOLDER_VALUES.items():
+        if os.getenv(env_var) == placeholder:
+            logger.warning(
+                "%s is still set to the .env.example placeholder value. This is fine "
+                "for local development, but must be changed to a real, unique value "
+                "before any deployment reachable outside your own machine.",
+                env_var,
+                extra={"event": "placeholder_credential", "variable": env_var},
+            )
+
+
 def _check_rate_limit_settings() -> None:
     # Importing here (not at module top) avoids a circular import: rate_limit.py
     # already validates and logs a warning + falls back to a safe default for any
@@ -76,4 +107,5 @@ def validate_startup_config() -> None:
     """
     _check_cors_origins()
     _check_rate_limit_settings()
+    _check_placeholder_credentials()
     logger.info("Startup configuration validated", extra={"event": "config_validated"})

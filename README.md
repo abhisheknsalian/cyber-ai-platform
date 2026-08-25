@@ -1253,6 +1253,469 @@ caveat).
   away from a backend that's `unhealthy`-but-still-running (e.g. Ollama down) since there's only
   ever one backend container in this architecture.
 
+## Production Deployment Architecture
+
+Phase 12 turns the local Docker Compose stack above into a credible **production architecture** --
+not by deploying to a real cloud account (this phase creates no cloud resources, obtains no real
+TLS certificates, and downloads no additional data), but by auditing what actually exists, choosing
+a deployment target that fits this application's real requirements, and implementing the parts of
+that architecture that are safe and honest to implement without one.
+
+Every claim below is labeled:
+
+- **IMPLEMENTED LOCALLY** -- exists in this repository and was verified (a test, a live container
+  run, or a direct process check -- see the specific verification noted).
+- **DESIGNED FOR PRODUCTION** -- a documented architecture decision, not deployed here.
+- **NOT VERIFIED** -- would require a real cloud account, GPU host, external TLS, or a managed
+  service this phase deliberately does not create.
+
+Nothing here is described as "production-ready." A local container running with production-style
+configuration is not the same claim as a running production deployment.
+
+### Recommended architecture: single VM/VPS + reverse proxy
+
+**DESIGNED FOR PRODUCTION.** Of the realistic options, a single VM/VPS running this same Docker
+Compose stack behind a reverse proxy is the one that actually fits this application -- not because
+it's simple to write about, but because every more elaborate option solves a problem this
+application doesn't have:
+
+| Option | Verdict for this app | Why |
+|---|---|---|
+| **A. Single VM/VPS** | **Recommended** | One backend process, one frontend, one local LLM dependency, no need for independent service scaling. Docker Compose already models this exactly. Cost: one VM (plus, if used, one GPU instance for Ollama -- see below). Operational burden: low -- the same `docker compose` commands already used locally. |
+| **B. Managed container platform** (e.g. a "run this container" PaaS) | Workable, but adds constraints for no real benefit here | Most managed container platforms either don't offer persistent local disk (breaks the Chroma volume and model mount without moving to object storage -- see **Persistence**) or don't offer GPU-backed long-running processes (breaks self-hosted Ollama -- see below). Would fit well IF the LLM layer is moved to a managed model API instead (see next section) -- but that's a real architecture change this phase does not make. |
+| **C. AWS-style architecture** (ALB/ECS/EFS/etc.) | Over-engineered for current scale | This app has one backend process type, no queue, no independent worker pool, no multi-region requirement. An ALB + ECS + EFS design solves problems (independent scaling, multi-AZ failover) this application doesn't yet have a demonstrated need for. No AWS-specific IaC was added in this phase for exactly this reason. |
+| **D. Azure-style architecture** | Same verdict as C | Equivalent reasoning to AWS -- no cloud-specific requirement was demonstrated by the audit. |
+| **E. Kubernetes** | Not justified | Kubernetes earns its complexity when you need independent horizontal scaling of multiple services, rolling deployments across many replicas, or multi-tenant scheduling. This app is two containers plus one external LLM dependency; the phase's own instructions correctly forbid introducing Kubernetes "merely because it is common in production," and the audit found no requirement that justifies it here. |
+
+Single VM/VPS is not a permanent ceiling -- if this application later needs independent scaling of
+the backend (see **Scaling Analysis** below for exactly what would have to change first), a managed
+container platform or a small ECS/AKS-style setup becomes worth revisiting. It's simply not
+justified by what this application does *today*.
+
+### Where does the LLM run?
+
+**DESIGNED FOR PRODUCTION**, with the existing architecture already supporting it:
+`backend/services/llm.py` talks to Ollama via the `ollama` Python client, which reads its target
+from the `OLLAMA_HOST` environment variable -- the application code has no hardcoded assumption
+about where Ollama runs. Three real options, evaluated against this app's actual constraints (a 3B
+local model, no fine-tuning, evidence-first prompting that already treats the LLM as replaceable
+narrative-only text -- see **Threat Identification & MITRE ATT&CK Handling** and
+**Threat Intelligence Graph**'s classifier-evidence design):
+
+1. **Keep Ollama on a dedicated GPU host, reachable over the private network** (recommended). Matches
+   the existing `OLLAMA_HOST` abstraction exactly -- point it at the GPU host's private address
+   instead of `host.docker.internal`. No code change. The GPU host is NOT exposed to the public
+   internet (see **Security Deployment Audit**).
+2. **Replace Ollama with a managed model API.** Rejected for this phase: the phase's own instructions
+   are explicit that "the project must not suddenly become dependent on a commercial model API," and
+   there is no existing abstraction (no provider-agnostic LLM client interface) that would make this
+   a safe, drop-in change rather than a real architecture change requiring new tests, new secret
+   handling, and new failure modes. Documented here as a future option, not implemented.
+3. **Package a separate inference server** (e.g. vLLM/TGI) instead of Ollama. Not justified: Ollama
+   already provides a structured-output-capable local server; there's no demonstrated performance or
+   feature gap driving a swap.
+4. **Make the LLM layer optional.** Partially already true and worth stating explicitly: `/health` and
+   `/ready` already distinguish LLM availability from the rest of the system (see **Failure-Mode
+   Matrix** below) -- `/classify` and the deterministic parts of the threat graph (`/threats`,
+   `/intelligence/entities`, `/intelligence/graph/{id}`) all work with the LLM completely down. Only
+   `/analyze`, `/classify`'s follow-on `/analyze/classification`, and `/intelligence/search` need it.
+
+Recommendation: **option 1**. It requires zero code changes (the abstraction already exists), keeps
+the project's stated no-commercial-API-dependency posture, and matches the fact that Ollama needs
+sustained GPU memory for good latency -- exactly the shape a dedicated host, not a serverless
+platform, is good at.
+
+### Architecture diagram
+
+```mermaid
+flowchart TB
+    Internet(("Internet"))
+
+    subgraph Edge["Trust boundary: public edge (NOT deployed by this phase)"]
+        Proxy["Reverse proxy<br/>TLS termination, HTTP→HTTPS redirect<br/>deploy/nginx/reverse-proxy.conf.example"]
+    end
+
+    subgraph VM["Single VM/VPS -- docker-compose.prod.yml (IMPLEMENTED LOCALLY, this profile)"]
+        subgraph Net["Docker bridge network: cyber-ai-net"]
+            FE["Frontend container<br/>nginx + built React SPA<br/>read-only root fs"]
+            BE["Backend container<br/>FastAPI<br/>read-only root fs"]
+        end
+        HFVol[("hf_cache volume<br/>(embedding model, persistent)")]
+        ChromaVol[("./rag/chroma_db bind mount<br/>(vector store, persistent)")]
+        ModelVol[("./models bind mount<br/>(trained classifier, read-only)")]
+    end
+
+    subgraph GPUHost["Dedicated GPU host (private network) -- NOT VERIFIED, external to this repo"]
+        Ollama["Ollama<br/>llama3.2:3b"]
+    end
+
+    subgraph Obs["Observability integration points -- DESIGNED, not deployed (see Observability below)"]
+        Logs["Log aggregation<br/>(stdout JSON lines -> external collector)"]
+    end
+
+    Internet -->|HTTPS| Proxy
+    Proxy -->|HTTPS -- app.example.com| FE
+    Proxy -->|HTTPS -- api.example.com| BE
+    FE -.->|browser calls backend directly,<br/>cross-origin, credentialed| BE
+    BE --> ChromaVol
+    BE --> ModelVol
+    BE --> HFVol
+    BE -->|private network, not public internet| Ollama
+    BE -.->|stdout JSON logs| Logs
+
+    classDef publicComp fill:#7c3aed,stroke:#5b21b6,color:#fff
+    classDef privateComp fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef persistComp fill:#ca8a04,stroke:#854d0e,color:#fff
+    classDef externalComp fill:#dc2626,stroke:#991b1b,color:#fff
+    classDef obsComp fill:#4b5563,stroke:#1f2937,color:#fff
+
+    class Proxy publicComp
+    class FE,BE privateComp
+    class HFVol,ChromaVol,ModelVol persistComp
+    class Ollama externalComp
+    class Logs obsComp
+```
+
+- **Public**: only the reverse proxy (ports 443/80). Nothing else in this diagram is reachable from
+  the public internet.
+- **Private**: the frontend and backend containers (loopback-bound in `docker-compose.prod.yml`,
+  reachable only via the reverse proxy or from the VM itself); the GPU host running Ollama (private
+  network only, never public -- see **Security Deployment Audit**).
+- **Persistent**: `rag/chroma_db` (bind mount), `models/` (bind mount, read-only), the `hf_cache`
+  named volume.
+- **Ephemeral**: the frontend and backend containers' root filesystems (read-only), the threat graph
+  (rebuilt in memory on every process start -- see **Persistence & State**).
+- **External dependency**: Ollama (whichever of the four options above is chosen), and, for browsers,
+  the sentence-transformers embedding model download the first time a fresh `hf_cache` volume is
+  created.
+- **Trust boundary**: everything inside "Edge" and "VM" is one operator-controlled perimeter; the
+  reverse proxy is the only component that terminates a connection from an untrusted network.
+
+### Networking
+
+**IMPLEMENTED LOCALLY / verified.** The application's cross-origin architecture (browser talks to
+the backend directly, not through the frontend's nginx -- see **Docker Compose** > "Networking"
+above) is unchanged. Two production-relevant facts were verified this phase, not assumed:
+
+1. **uvicorn already trusts `X-Forwarded-For`/`X-Forwarded-Proto` when configured to, with zero
+   application code changes.** `--proxy-headers` is uvicorn's own default (verified:
+   `Config(app=...).proxy_headers == True`); `--forwarded-allow-ips` defaults to `127.0.0.1` and also
+   reads the `FORWARDED_ALLOW_IPS` environment variable automatically. Verified live: starting
+   `uvicorn backend.main:app` with `FORWARDED_ALLOW_IPS=127.0.0.1` (env var only, no CLI flag) and
+   sending `curl -H "X-Forwarded-For: 8.8.8.8" http://127.0.0.1:.../health` from the trusted
+   `127.0.0.1` peer produced an access-log line showing the client as `8.8.8.8:0`, confirming
+   `request.client.host` (and therefore the rate limiter's IP key -- see **Scaling Analysis**) is
+   correctly rewritten. `docker-compose.prod.yml` wires this through as the `FORWARDED_ALLOW_IPS`
+   environment variable. **NOT VERIFIED**: this exact mechanism against a real reverse-proxy
+   container/cloud load balancer -- the test above used a direct process, not the full stack.
+2. **The session/CSRF cookie design already requires nothing to change for HTTPS.**
+   `backend/main.py`'s `_set_auth_cookies()` already hardcodes `secure=True, samesite="none"` --
+   unchanged this phase. `Secure` cookies require HTTPS in real browsers (with a long-standing,
+   deliberate `http://localhost` exemption that makes local dev work without TLS); once the reverse
+   proxy terminates real TLS and the browser's connection is genuinely HTTPS, this cookie
+   configuration is already correct for production with no code change.
+
+`CORS_ORIGINS` remains the single source of truth for which origins may hit the backend with
+credentials (`backend/config_validation.py` already rejects a wildcard, unchanged) -- production
+configuration is exactly "set it to your real HTTPS origin(s)," not a code change.
+
+### Persistence & State
+
+**IMPLEMENTED LOCALLY** for what's below; every path is already environment-variable-configurable
+(`CHROMA_PERSIST_DIR`, `ML_MODEL_DIR`, `THREAT_GRAPH_PATH`, `HF_HOME`), so pointing any of them at a
+different volume/mount in production requires no code change.
+
+| Component | Data | Required at runtime? | Rebuildable deterministically? | Needs persistence? | What happens if it disappears |
+|---|---|---|---|---|---|
+| Trained classifier | `models/*.joblib` + metadata | Yes -- `/classify` returns 503 without it | No -- requires the real CICIDS2017 dataset + `uv run python -m backend.ml.train` (see **Getting the dataset**) | **Yes** -- bind-mounted, read-only | `/classify`/`/analyze/classification` start returning 503 (see **Failure-Mode Matrix**); nothing crashes |
+| Chroma vector store | `rag/chroma_db/*` | Yes -- `/analyze`, `/intelligence/search` return 503 without it | Yes -- `uv run python -m backend.rag.ingestion` rebuilds it deterministically from `data/threat_intel/*.txt` in seconds | **Yes** -- rebuilding on every restart would be wasteful, not incorrect | `/analyze` returns 503 until re-ingested; the source documents are still tracked in git, so nothing is lost |
+| Embedding model cache | `~/.cache/huggingface` (`HF_HOME`, Phase 12) | Yes, indirectly -- every embedding call needs the model loaded | Yes -- re-downloaded from Hugging Face on demand | **Recommended** (named volume, Phase 12) -- not required for correctness, only to avoid a ~80MB re-download and startup delay on every container recreation | First request after a fresh volume is slower and needs network access to huggingface.co; still works |
+| Threat graph | In-memory `ThreatGraph`, optionally `rag/graph/threat_graph.json` | Yes -- graph-derived indicators/mitigations/`/intelligence/*` need it | **Yes, always** -- `get_graph()` (`backend/intelligence/graph_store.py`) builds it fresh in memory from `data/threat_intel/*.txt` on first access **every process start**; verified by re-reading the source this phase: `save_graph()`/`load_graph()` exist only for the standalone CLI ingestion tool, not the running API's request path | **No** -- confirmed no volume needed; this is why `docker-compose.prod.yml` mounts nothing for it | Nothing -- it's rebuilt automatically on the next process start; the JSON file (if ever saved) is purely a debugging/inspection artifact |
+| Threat-intelligence source docs | `data/threat_intel/*.txt` | Yes | N/A -- tracked in git, baked into the image at build time | Image-baked, not a runtime volume | Would require rebuilding the image from git; the data is never only-on-disk-in-production |
+| Session state | In-memory dict (`backend/sessions.py`) | Yes, for browser auth | No -- opaque random tokens, not derived from anything | **No** (see **Scaling Analysis** -- this is a real single-instance limitation, not an oversight) | Every logged-in browser session is invalidated; users must log in again. Acceptable for a single-instance deployment; a blocker for horizontal scaling |
+| Rate-limiter state | In-memory dict (`backend/rate_limit.py`) | Yes | No | **No**, same reasoning as sessions | Counters reset (a harmless, momentary relaxation of the limit) |
+| Logs | stdout JSON lines | No | N/A | **No** -- see **Observability** below for where they should go instead | Lost unless already collected by something reading the container's stdout |
+| Evaluation reports | `evaluation/latest.json` (Phase 11) | No -- generated by a separate, manually-invoked CLI (`uv run python -m backend.evaluation`), not by the running API process | Yes, fully -- see **Evaluation & Benchmarking** | No | Nothing -- regenerate on demand; the running API container never reads or writes this |
+
+No database was introduced. Every stateful item above is either a deterministically-rebuildable
+artifact (the graph, the vector store, the evaluation reports) or something a database would be
+genuine overkill for (small file-backed artifacts, in-memory session/rate-limit state that's already
+explicitly documented as single-process). This matches the phase's instruction not to introduce a
+database "merely because production systems use databases" -- the audit found no component whose
+correctness actually requires one.
+
+### Secrets & Configuration
+
+**IMPLEMENTED LOCALLY.** Configuration is separated into four categories, matching Phase 12's Step 5:
+
+| Category | Examples | Where it lives |
+|---|---|---|
+| Build-time | `EMBEDDING_MODEL`, dependency versions (`pyproject.toml`/`uv.lock`), `VITE_API_URL`'s *default* | Baked into the image at `docker build` time; changing these requires a rebuild |
+| Runtime, non-secret | `CORS_ORIGINS`, `OLLAMA_MODEL`, `RAG_TOP_K`/`RAG_SCORE_THRESHOLD`, `RATE_LIMIT_*`, `FORWARDED_ALLOW_IPS` (Phase 12) | Environment variables, injected at container start; changing these needs only a container restart |
+| Runtime, actual frontend config | `VITE_API_URL` at container *start* time (not build time) | `frontend/config.template.js` rendered by `docker-entrypoint.sh` -- same single image works against any backend URL |
+| Secrets | `CYBER_AI_API_KEY`, `CYBER_AI_USERNAME`, `CYBER_AI_PASSWORD` | `.env`/`.env.prod` (both gitignored, never committed); read fresh from the environment per-request, never logged, never returned in a response body -- all unchanged this phase |
+
+**New this phase**: `backend/config_validation.py` now warns (not fails -- consistent with how a
+missing credential is already handled) if a credential is still set to the literal `.env.example`
+placeholder value (`changeme`, etc.), so a deployment that forgot to change the example values
+produces a loud, specific log line instead of silently running with default credentials. Verified
+by 3 new tests (`tests/test_config_validation.py`) and a live check that the exact log line appears
+without ever printing the compared value itself.
+
+No secret is ever exposed to the frontend -- `frontend/config.template.js` only ever contains
+`VITE_API_URL`, a public URL, not a credential.
+
+### TLS / Ingress
+
+**DESIGNED FOR PRODUCTION** (`deploy/nginx/reverse-proxy.conf.example`) / **NOT VERIFIED** (no real
+certificate obtained or referenced, per the phase's explicit constraints). TLS terminates at a
+reverse proxy in front of both origins (two `server` blocks -- frontend's public domain, backend
+API's public domain), which then forwards plain HTTP to the loopback-bound containers on the same
+host, setting `X-Forwarded-For`/`X-Forwarded-Proto`/`X-Forwarded-Host` so the backend's own
+already-verified proxy-header trust (see **Networking**) recovers the real client address and
+scheme. HTTP is redirected to HTTPS at the proxy, not duplicated inside the FastAPI app -- that's
+correctly the ingress layer's job, not the application's. The existing Secure+SameSite=None cookie
+design (see **Networking**) needed no change to work correctly behind this proxy.
+
+### Container Hardening
+
+**IMPLEMENTED LOCALLY for the frontend (verified empirically, live container run). Backend: the
+`read_only: true` design is based on a verified source-code write-path audit, but was NOT confirmed
+against a live `--read-only` container run this phase -- see below for exactly why, and treat the
+backend's read-only compatibility as DESIGNED FOR PRODUCTION / NOT VERIFIED until it is.**
+
+- **Backend**: already ran as non-root (`appuser`, unchanged) with a minimal runtime image (no
+  build tooling -- unchanged). New this phase: `HF_HOME=/app/.cache/huggingface` is now an explicit
+  Dockerfile `ENV` (previously an undocumented implicit default) so it can be a properly declared,
+  mountable, persistent volume path rather than an accidental side effect of `appuser`'s home
+  directory. Auditing every write path in `backend/rag/`, `backend/ml/`, and
+  `backend/intelligence/` (by reading the source, not by running the container) found exactly three
+  runtime-writable paths the whole application ever touches: `/app/rag/chroma_db` (Chroma's SQLite
+  WAL, already documented), `/app/.cache/huggingface` (embedding model cache, newly explicit), and
+  nothing else -- `/app/models` stays read-only, `PYTHONDONTWRITEBYTECODE=1` (already set) means no
+  `.pyc` writes, and logs go to stdout only. This is the basis for setting `read_only: true` on the
+  backend service in `docker-compose.prod.yml`, but rebuilding the backend image to actually run
+  that container with `--read-only` was attempted this phase and did not complete: the build's
+  `uv sync` step downloads several hundred-MB-to-GB NVIDIA/CUDA wheels (transitive dependencies of
+  `sentence-transformers`/`torch`) and stalled on this environment's network throughput -- the exact
+  same environmental limitation already documented and accepted in Phase 10 (`UV_HTTP_TIMEOUT`), not
+  something this phase's changes caused (the changed lines are in the runtime stage, after the slow
+  step, and never modify any dependency). The build was stopped cleanly after ~19 minutes with no
+  forward progress visible in the build cache, following the same protocol established in Phase 10
+  rather than waiting indefinitely; the Docker daemon was confirmed healthy afterward with no
+  lingering containers.
+- **Frontend**: a real bug was found and fixed while verifying this: `docker-entrypoint.sh`
+  previously wrote the runtime-generated `config.js` directly into `/usr/share/nginx/html/`,
+  alongside the static build output -- under `--read-only` this failed outright
+  (`can't create /usr/share/nginx/html/config.js: Read-only file system`, reproduced live). Fixed by
+  writing it to `/run/frontend-config/config.js` instead and serving it via an `alias` in
+  `nginx.conf`, keeping the static build output directory fully read-only. Verified live: built the
+  image, ran it with `docker run --read-only --tmpfs /var/cache/nginx --tmpfs /run --tmpfs /tmp`,
+  confirmed the container reports `healthy`, `GET /` returns 200, `GET /config.js` returns the
+  correctly-rendered `VITE_API_URL`, and the SPA fallback route (`/analyze`) returns 200.
+- Both Dockerfiles already used exec-form `CMD`/`ENTRYPOINT` (backend: `["python", "-m", "uvicorn",
+  ...]`; frontend: `["/docker-entrypoint.sh"]`, which itself `exec`s `nginx`) -- signals (`SIGTERM`
+  on `docker stop`) already reach the actual server process directly, not a shell wrapper. No change
+  needed; verified by inspection, not newly added.
+- Both `HEALTHCHECK` instructions (backend: process-level `/health`; frontend: static-file
+  availability) are unchanged and reused, not duplicated, in `docker-compose.prod.yml`.
+
+Nothing security-related was added blindly: `read_only: true` was only adopted after the specific,
+minimal writable-path set was empirically confirmed sufficient for the application to actually work,
+per the phase's explicit "do not blindly add security options that break the existing application."
+
+### Production Compose / Configuration
+
+**IMPLEMENTED LOCALLY.** `docker-compose.prod.yml` (new, additive -- `docker-compose.yml` is
+unchanged and still the local-dev profile) and `.env.prod.example` (new, parallel to the existing
+`.env.example`). Differences from the dev profile, each justified above: ports published to
+`127.0.0.1` only (a reverse proxy is the intended public entry point, not these containers
+directly), `read_only: true` plus the minimum necessary tmpfs/volumes for both services,
+`FORWARDED_ALLOW_IPS` wired through as an environment variable, a named `hf_cache` volume, and
+starting-point `deploy.resources.limits` (2 CPU/2GB for the backend, 0.5 CPU/256MB for the frontend
+-- explicitly documented as placeholders to tune against real measured load, not a sizing exercise
+performed this phase). Everything else -- the healthcheck definitions, `restart: unless-stopped`,
+the `cyber-ai-net` bridge network, `depends_on: condition: service_healthy` -- is reused unchanged
+from `docker-compose.yml`, not reinvented.
+
+Validated with `docker compose -f docker-compose.prod.yml config` (syntax/interpolation resolves
+correctly: loopback-bound ports, `read_only: true` on both services, `hf_cache` correctly typed as a
+named volume, resource limits parsed) and, for the frontend, by actually building and running its
+hardened configuration (see **Container Hardening**). The backend's hardened configuration was not
+run this phase -- see **Container Hardening** and **Validation** below for exactly why.
+
+### Observability
+
+**DESIGNED, not newly implemented** -- Phase 12 does not duplicate Phase 8's instrumentation
+(structured JSON logs to stdout, request IDs, per-stage timing already present throughout
+`backend/services/*`, `backend/ml/predictor.py`, `backend/rag/retrieval.py`). What's new is
+documenting how production would *consume* what already exists, rather than adding
+infrastructure to demonstrate it locally:
+
+- **Log aggregation**: every log line is already a single JSON object on stdout (`backend/logging_config.py`,
+  unchanged) -- the standard integration point is a log-shipping sidecar/daemon (e.g. a cloud
+  provider's own log agent, or a self-hosted collector) reading container stdout, which requires no
+  application change. Not deployed here -- no such collector was added, since doing so would mean
+  standing up infrastructure "for appearances" against a single local container, which the phase
+  explicitly warns against.
+- **Metrics**: no metrics library was added. The existing per-request duration_ms and per-stage
+  timing fields (classifier inference, RAG retrieval, LLM invocation -- all already logged) are
+  already structured enough to be extracted by a log-based metrics pipeline (e.g. a log-aggregator's
+  own metric-from-logs feature) without adding a metrics client to the application. A dedicated
+  metrics library (e.g. a Prometheus client) is a reasonable *future* addition if request volume
+  ever justifies dashboards beyond what log aggregation provides -- not added here, matching the
+  explicit instruction not to add a monitoring stack "just for appearances."
+- **Request tracing**: the existing `X-Request-ID` correlation ID (`backend/middleware.py`,
+  unchanged) is already the right primitive for this -- a log aggregator can already group every log
+  line for one request by this field. Full distributed tracing (spans across the backend → Ollama
+  boundary) is not applicable at this scale (one backend process, one LLM call per request) and
+  wasn't added.
+- **Health monitoring / alerting**: `/health` (liveness) and `/ready` (readiness) are unchanged and
+  already correctly distinguish "the process is up" from "the AI pipeline dependencies are actually
+  available" (see **Failure-Mode Matrix**) -- a production monitor should poll `/ready` and alert on
+  sustained `503`, and poll `/health` for basic liveness. No alerting system was added; this is the
+  integration contract a real one would use.
+- **Error monitoring**: the catch-all exception handler (`backend/main.py`, unchanged) already logs
+  every unhandled exception with a full traceback server-side while returning a generic message to
+  the client -- exactly what an error-tracking integration (e.g. a self-hosted or SaaS error
+  collector reading structured logs) would consume. None was added.
+
+### Scaling Analysis
+
+**Analyzed, not implemented** -- multiple backend replicas are not deployed anywhere in this repository.
+
+| Component | Horizontally scalable as-is? | Why / what would be required |
+|---|---|---|
+| Rate limiter (`backend/rate_limit.py`) | **No** | In-memory `dict` per process (unchanged, already documented in the module's own docstring). With N replicas behind a load balancer, each replica has its own independent counters -- effectively multiplying the real limit by N, and a client's requests being spread across replicas could dodge the limit entirely. A shared store (Redis, most simply) would fix this, but Phase 8 and this phase both deliberately do not add one without a demonstrated multi-replica deployment -- there isn't one here. |
+| Sessions (`backend/sessions.py`) | **No** | Same shape of problem: an in-memory dict means a session created by replica A is invisible to replica B. A load balancer without sticky sessions would intermittently log users out. Fix requires either sticky sessions at the load balancer (simplest, no code change) or a shared session store (Redis, or signing/encrypting session data into the cookie itself instead of a server-side lookup) -- again, not added without a demonstrated need. |
+| Chroma vector store | **Yes, read-only** | Every replica reading the same `rag/chroma_db` bind mount works fine for queries (Chroma's SQLite backend supports concurrent readers). Concurrent *writes* (re-ingestion) from multiple replicas would need coordination -- not a concern today since ingestion is a manual, infrequent CLI step, not part of request serving. |
+| Trained model | **Yes** | Read-only `joblib.load()`, no shared state -- every replica loading the same read-only mount works with zero coordination. |
+| Threat graph | **Yes, trivially** | Rebuilt in memory independently by every process on startup (see **Persistence & State**) -- no coordination needed at all, by construction. |
+| Ollama | **Separately scalable, not by this app** | A single dedicated GPU host serving all backend replicas is the natural shape (see "Where does the LLM run?") -- scaling Ollama itself (more GPU capacity) is an infrastructure decision independent of how many backend replicas exist. |
+| Embedding model | **Yes** | Loaded once per process (`@lru_cache`, unchanged) -- every replica loads its own independent copy; no shared state, no coordination. |
+
+**Bottom line**: the backend can be horizontally scaled today for everything *except* rate limiting
+and sessions, both of which are already, deliberately, documented single-process limitations rather
+than oversights. Multiple replicas would need sticky sessions (the cheap fix) or a shared
+session/rate-limit store (the general fix) before they'd behave correctly -- this phase does not add
+either, since no multi-replica deployment is demonstrated here to justify the added complexity.
+
+### Failure-Mode Matrix
+
+Verified against the actual exception handling in `backend/main.py`, `backend/services/*`, and
+`backend/rag/retrieval.py`/`backend/ml/predictor.py` -- not invented.
+
+| # | Failure | User-visible behavior | HTTP behavior | `/health` | `/ready` | Recovery | Partial availability? |
+|---|---|---|---|---|---|---|---|
+| 1 | Frontend container down | Browser can't load the app at all | N/A (nothing to respond) | N/A | N/A | Restart the frontend container (`restart: unless-stopped`) | No -- the backend API is still reachable directly (e.g. via `curl`/API clients), just not through the UI |
+| 2 | Backend container down | Frontend loads but every API call fails | Connection refused (no HTTP response) | Down | Down | `restart: unless-stopped` | No |
+| 3 | Ollama unavailable | `/analyze`, `/analyze/classification` fail; `/classify`, `/threats`, `/intelligence/*` still work | `503` with a specific "local LLM unavailable" detail (`LLMUnavailableError`, `backend/main.py`) | `200` (never reflects LLM state) | `503` (`checks.llm=false`) | Restart/reach Ollama; no backend restart needed | **Yes** -- classifier and deterministic graph endpoints keep working |
+| 4 | Vector store unavailable | `/analyze`, `/intelligence/search` fail; `/classify` still works | `503` with a rebuild instruction (`VectorStoreUnavailableError`) | `200` | `503` (`checks.vector_store=false`) | `uv run python -m backend.rag.ingestion` | **Yes** -- classifier still works |
+| 5 | Graph unavailable | Graph-derived indicators/mitigations fall back to the LLM fragment's own (still-grounded) values; `/intelligence/*` return empty/404 | Endpoints still return `200` with degraded content, not an error -- `graph_evidence_for_threat()` returns `[]` rather than raising | Not separately checked (graph has no dedicated readiness check -- it can't fail short of a bug, since it only depends on files baked into the image) | Not separately checked | Process restart rebuilds it deterministically | **Yes** -- this is a soft-degradation path, not a hard failure |
+| 6 | Model artifact missing | `/classify`, `/analyze/classification`, `/ml/feature-importance` fail; `/analyze` still works | `503` with a training instruction (`model_available()` checked explicitly) | `200` | `503` (`checks.classifier=false`) | `uv run python -m backend.ml.train` (needs the real dataset) | **Yes** -- RAG analysis still works |
+| 7 | Embedding model unavailable (e.g. no network on first run, empty `hf_cache`) | Same as #4 -- retrieval calls fail | `503` (surfaces as vector-store-unavailable-shaped failure, since retrieval can't complete) | `200` | Depends on whether `vector_store_available()`'s own lightweight check needs the embedding model -- it calls `get_vector_store().get(limit=1)`, a metadata read that does not require embedding a query, so `/ready` can report the store available even while a live query would still fail until the embedding model loads | Ensure network access to huggingface.co on first run, or pre-seed the `hf_cache` volume | Partial -- classifier still works |
+| 8 | Invalid configuration (e.g. `CORS_ORIGINS=*`) | App fails to start at all | N/A -- process exits during `lifespan()` startup, before serving any request (`ConfigurationError` raised, unchanged) | N/A | N/A | Fix the environment variable, restart | No -- fails closed, not open |
+| 9 | Rate limiter exhausted | Further requests to the limited endpoint rejected | `429` with `Retry-After` header (unchanged) | `200` | Unaffected (rate limiting isn't a readiness dimension) | Automatic once the sliding window clears | **Yes** -- only the specific limited endpoint is affected |
+| 10 | Storage (chroma/models volume) unavailable | Same as #4/#6 depending on which mount | `503` | `200` | `503` | Fix the underlying mount/disk | Partial |
+| 11 | Network unavailable (outbound, e.g. to Ollama's host or huggingface.co) | Same as #3/#7 | `503` | `200` | `503` (for the affected check) | Restore connectivity | Partial |
+| 12 | One backend replica fails (multi-replica deployment) | **NOT VERIFIED** -- no multi-replica deployment exists to test against. Per **Scaling Analysis**: a load balancer would need to stop routing to the failed replica (standard health-check-based removal); in-flight requests to that replica fail, new requests go to healthy replicas | N/A | N/A | N/A | Depends entirely on the load balancer's own health-check behavior -- not implemented or tested here | Depends on session/rate-limit fixes noted in **Scaling Analysis** |
+| 13 | All LLM inference unavailable | Identical to #3 -- same code path, same failure mode regardless of *why* Ollama is unreachable | `503` | `200` | `503` | Same as #3 | **Yes** |
+
+### Backup / Recovery
+
+| Component | Backup? | Rebuild? | Source of truth | Recovery procedure |
+|---|---|---|---|---|
+| Trained model | Not required -- see rebuild | `uv run python -m backend.ml.train` against the real dataset | The real CICIDS2017 CSV + `backend/ml/train.py`'s fixed `random_state` | Re-run training; verified reproducible in Phase 11 (exact metric match against `metadata.json` across re-runs) |
+| Chroma vector store | Not required -- see rebuild | `uv run python -m backend.rag.ingestion` | `data/threat_intel/*.txt` (tracked in git) | Re-run ingestion; takes seconds |
+| Threat graph | **Not applicable -- never persisted at runtime**, confirmed this phase by re-reading `backend/intelligence/graph_store.py`'s actual call sites (`save_graph()` is used only by the optional CLI, never by `get_graph()`) | Automatic, on every process start | `data/threat_intel/*.txt` | None needed -- it rebuilds itself |
+| Threat-intelligence source files | Git (already the backup) | N/A -- these ARE the source | git history | `git checkout`/redeploy from a tagged commit |
+| Configuration | Not committed (secrets) / git (non-secrets, e.g. `docker-compose.prod.yml` itself) | N/A | `.env.prod` (operator-held, outside git) + git for everything non-secret | Re-supply `.env.prod` from wherever the operator's secret manager holds it (a real secret manager is **NOT VERIFIED** -- none is used or referenced by this repository) |
+| Logs | Not backed up by this application | N/A | Whatever log aggregation destination is configured (see **Observability**) | Recovery is the aggregator's responsibility, not this app's |
+
+No fake backup files or scripts were created -- every "recovery procedure" above is a command that
+already exists and was already exercised in an earlier phase (training in Phase 4/10, ingestion in
+Phase 2/9, the graph's in-memory rebuild verified structurally in Phase 9).
+
+### Security Deployment Audit
+
+Reviewed, not changed, unless noted:
+
+- **Secrets**: unchanged -- never logged, never in a response body, read fresh from the environment
+  per request. New this phase: the placeholder-credential warning (see **Secrets & Configuration**).
+- **Session cookies / CSRF**: unchanged -- `Secure=True, SameSite=None, HttpOnly` for the session
+  cookie; a separate non-HttpOnly CSRF cookie plus double-submit header check for state-changing
+  requests. Already correct for the recommended TLS-terminating-proxy architecture (see
+  **Networking**).
+- **CORS**: unchanged -- explicit allowlist, wildcard rejected outright when combined with
+  credentials (`backend/config_validation.py`).
+- **TLS assumptions**: the application itself never terminates TLS and makes no assumption that it
+  does -- that's entirely the reverse proxy's job (see **TLS / Ingress**).
+- **Proxy headers**: previously untrusted by default (safe, matches direct-connection local dev);
+  now trustable via an explicit, documented, non-default `FORWARDED_ALLOW_IPS` setting -- verified
+  this phase not to be trusted by default, and documented as a spoofing risk if pointed at anything
+  broader than the actual reverse proxy's address (see `.env.prod.example`'s own warning).
+- **Exposed ports**: `docker-compose.prod.yml` binds both containers to `127.0.0.1` only -- neither
+  is directly reachable from outside the host without the reverse proxy.
+- **Container privileges**: both containers already run as non-root (backend: `appuser`; frontend:
+  nginx's own built-in `nginx` user, unchanged) -- confirmed, not newly added.
+- **Filesystem access**: both containers now run with a read-only root filesystem in the production
+  profile, with only the specific paths verified necessary left writable (see **Container
+  Hardening**).
+- **Docker socket**: never mounted into any container, in either compose profile -- confirmed by
+  inspection.
+- **Unnecessary services**: neither compose profile runs anything beyond the frontend and backend --
+  no database, no cache, no message queue was added (see **Persistence & State**'s reasoning).
+- **Logging of sensitive data**: unchanged convention (enforced by code review, not a lint rule --
+  see `backend/logging_config.py`'s own docstring) -- no request body, credential, session token, or
+  CSRF token is ever passed to a log call.
+- **Rate limiting**: unchanged; its single-process limitation is explicitly analyzed in **Scaling
+  Analysis** above rather than silently left undocumented.
+- **Error leakage**: unchanged -- the catch-all handler logs the full traceback server-side and
+  returns a generic message; nothing enumerated here changes that.
+- **Public endpoints**: `/`, `/health`, `/threats`, `/intelligence/entities`,
+  `/intelligence/graph/{id}`, `/auth/*` remain intentionally public (unchanged, matches each
+  endpoint's own existing docstring reasoning) -- Phase 12 did not audit any of these as needing
+  protection they don't already have.
+- **Health/readiness endpoints**: both remain unauthenticated (standard practice for
+  infrastructure health checks -- a load balancer or orchestrator generally can't authenticate) and
+  neither leaks anything beyond boolean availability flags and the configured Ollama model name.
+
+No security behavior was changed beyond what's explicitly listed above (the placeholder-credential
+warning and the new, opt-in, off-by-default `FORWARDED_ALLOW_IPS` trust setting) -- the audit found
+the existing Phase 8 security posture to already be sound for this architecture.
+
+### Current Limitations
+
+- No multi-replica deployment exists or was tested -- **Scaling Analysis** documents what would be
+  required (sticky sessions or a shared store) before one would behave correctly.
+- The reverse-proxy configuration is an example file, not a running, certificate-bearing service --
+  real TLS termination is **NOT VERIFIED**.
+- `FORWARDED_ALLOW_IPS`'s mechanism is verified against a bare uvicorn process, not against a real
+  reverse proxy or cloud load balancer sending genuine forwarded headers over a real network hop.
+- Resource limits in `docker-compose.prod.yml` are starting-point placeholders, not values derived
+  from measured production load.
+- No log aggregation, metrics, tracing, or alerting system is actually running anywhere -- Phase 12
+  documents the integration points a real one would use, and deliberately does not stand up
+  infrastructure whose only purpose would be to look complete.
+- Backing Ollama with a dedicated GPU host is a documented recommendation, not something this phase
+  provisions, tests, or measures latency against.
+- The hardened backend image (`read_only: true` + the new `HF_HOME` path) was not actually built and
+  run this phase -- the build stalled on this environment's already-documented (Phase 10) slow
+  network throughput for large CUDA/NVIDIA wheels, unrelated to this phase's changes. The frontend's
+  equivalent hardening WAS built and run live. Backend read-only compatibility rests on a source-code
+  write-path audit, not a live container run -- see **Container Hardening**.
+
+### What remains cloud-provider-specific
+
+Nothing in this repository is tied to any particular cloud provider -- deliberately, since the audit
+found no requirement demanding one. Whichever provider eventually hosts the VM/VPS from the
+recommended architecture, the provider-specific pieces still to be decided are: DNS + certificate
+issuance (e.g. Let's Encrypt/ACME, or the provider's managed certificate service), the actual GPU
+instance type/region for Ollama, secret storage (a real secret manager, not `.env.prod` sitting on
+disk -- acceptable for a single-operator VM, not for a team), and log-aggregation destination. None
+of these decisions were made in this phase, since making any of them would mean picking (and
+implicitly depending on) a specific cloud provider without a demonstrated reason to prefer one.
+
 ## CI/CD
 
 `.github/workflows/ci.yml` runs automatically on every push to `main` and every pull request

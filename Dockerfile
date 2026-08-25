@@ -52,7 +52,8 @@ WORKDIR /app
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    HF_HOME=/app/.cache/huggingface
 
 # The installed virtualenv from the builder stage -- no uv, no build tooling, no
 # pip cache carried into the final image.
@@ -65,11 +66,17 @@ COPY --from=builder /app/.venv /app/.venv
 COPY backend/ backend/
 COPY data/threat_intel/ data/threat_intel/
 
-# Mount points for the two gitignored runtime artifacts this image never contains:
-# the trained classifier (models/) and the Chroma vector store (rag/chroma_db/).
-# Created here (and chowned) so a bind mount or named volume onto either path works
-# for the non-root user without extra host-side permission fiddling.
-RUN mkdir -p /app/models /app/rag/chroma_db \
+# Mount points for the gitignored runtime artifacts this image never contains: the
+# trained classifier (models/), the Chroma vector store (rag/chroma_db/), and the
+# sentence-transformers embedding model cache (HF_HOME above -- otherwise implicitly
+# resolved to $HOME/.cache/huggingface, which happens to already be under /app since
+# appuser's home is /app, but was never an explicit, documented, mountable path before
+# this). Created here (and chowned) so a bind mount or named volume onto any of these
+# paths works for the non-root user without extra host-side permission fiddling. These
+# three are also, deliberately, the ONLY paths this container ever writes to at
+# runtime -- see README "Container Hardening" for the read-only-root-filesystem
+# implication this makes possible.
+RUN mkdir -p /app/models /app/rag/chroma_db /app/.cache/huggingface \
     && chown -R appuser:app /app
 
 USER appuser

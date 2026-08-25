@@ -47,6 +47,31 @@ def test_non_url_cors_origin_is_rejected(monkeypatch):
         validate_startup_config()
 
 
+# --- Phase 12: placeholder-credential detection (warns, never fails startup) -------
+
+
+def test_placeholder_api_key_does_not_raise(monkeypatch):
+    monkeypatch.setenv("CYBER_AI_API_KEY", "changeme-generate-a-long-random-value")
+    validate_startup_config()  # must not raise -- a warning, not a startup failure
+
+
+def test_placeholder_username_and_password_logs_a_warning(monkeypatch, caplog):
+    monkeypatch.setenv("CYBER_AI_USERNAME", "changeme")
+    monkeypatch.setenv("CYBER_AI_PASSWORD", "changeme-use-a-strong-password")
+    with caplog.at_level("WARNING", logger="backend.config"):
+        validate_startup_config()
+    messages = [record.message for record in caplog.records]
+    assert any("CYBER_AI_USERNAME" in m and "placeholder" in m for m in messages)
+    assert any("CYBER_AI_PASSWORD" in m and "placeholder" in m for m in messages)
+
+
+def test_a_real_looking_credential_does_not_trigger_the_placeholder_warning(monkeypatch, caplog):
+    monkeypatch.setenv("CYBER_AI_API_KEY", "a-genuinely-random-64-char-value-not-the-placeholder")
+    with caplog.at_level("WARNING", logger="backend.config"):
+        validate_startup_config()
+    assert not any("placeholder" in record.message for record in caplog.records)
+
+
 def test_configuration_error_never_includes_a_secret_value(monkeypatch):
     monkeypatch.setenv("CORS_ORIGINS", "*")
     monkeypatch.setenv("CYBER_AI_API_KEY", "super-secret-value-should-never-appear")

@@ -1,0 +1,70 @@
+# Phase 12: EXAMPLE reverse-proxy configuration. Not wired into docker-compose.prod.yml
+# and not started by anything in this repository -- it requires a real domain and a
+# real TLS certificate, both explicitly out of scope for this phase (no real cloud
+# resources, no certificate generation). This file documents the recommended
+# production ingress shape; treat it as a starting point to adapt, not a
+# drop-in-and-run config. See README "TLS / Ingress" for the full reasoning.
+#
+# Assumes this proxy runs on the same host as docker-compose.prod.yml's containers
+# (see that file: both backend and frontend publish to 127.0.0.1 only), terminates TLS
+# for two origins -- the frontend's public domain and the backend API's public domain
+# -- and forwards to the loopback-bound container ports. Two origins, not one, because
+# the application's existing cross-origin session-cookie + CSRF design (SameSite=None,
+# double-submit CSRF token -- see backend/sessions.py, backend/security.py) already
+# works correctly with two separate HTTPS origins and was NOT changed for this phase
+# (no demonstrated need to consolidate them behind a single origin/path-based proxy).
+#
+# Replace every <PLACEHOLDER> below with real values. The certificate paths shown are
+# illustrative only (e.g. what certbot/Let's Encrypt would produce) -- this repository
+# does not include, generate, or reference any actual certificate file.
+
+# --- HTTP: redirect to HTTPS on both origins -----------------------------------
+server {
+    listen 80;
+    server_name app.<PLACEHOLDER-DOMAIN> api.<PLACEHOLDER-DOMAIN>;
+    return 301 https://$host$request_uri;
+}
+
+# --- Frontend origin (static SPA) ------------------------------------------------
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name app.<PLACEHOLDER-DOMAIN>;
+
+    ssl_certificate     /etc/letsencrypt/live/app.<PLACEHOLDER-DOMAIN>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/app.<PLACEHOLDER-DOMAIN>/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        # These three headers are what backend/main.py's uvicorn process (started
+        # with --proxy-headers, on by default -- see README "Networking") reads to
+        # recover the real client address and scheme. FORWARDED_ALLOW_IPS in
+        # .env.prod must list this proxy's address for them to be trusted.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+    }
+}
+
+# --- Backend API origin -----------------------------------------------------------
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name api.<PLACEHOLDER-DOMAIN>;
+
+    ssl_certificate     /etc/letsencrypt/live/api.<PLACEHOLDER-DOMAIN>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.<PLACEHOLDER-DOMAIN>/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+
+        # The backend's own JSON error responses and security headers
+        # (backend/middleware.py) are passed through unchanged -- this proxy adds
+        # nothing to and strips nothing from the application's response bodies.
+    }
+}

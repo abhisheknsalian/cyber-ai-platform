@@ -1,0 +1,130 @@
+# Phase 12: production-profile Compose file. This does NOT replace docker-compose.yml
+# (dev/local-stack profile, unchanged) -- it's an additive, separate file for a
+# single-VM production deployment, started explicitly with:
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+#
+# See README "Production Deployment Architecture" for the full recommended topology,
+# and .env.prod.example for every variable referenced below (never committed with real
+# values -- copy it to .env.prod and fill in real values, same convention as
+# .env.example/.env).
+#
+# What's different from docker-compose.yml, and why:
+#
+#   - Ports are published to 127.0.0.1 only, not 0.0.0.0. This stack does not
+#     terminate TLS itself -- a reverse proxy (external to this Compose file; see
+#     deploy/nginx/reverse-proxy.conf.example) is expected to run on the same host,
+#     listen on the public interface, terminate TLS, and forward to these
+#     loopback-bound ports. This is the same "reverse proxy in front of loopback-bound
+#     app containers" pattern used by most single-VM production deployments; it is
+#     NOT wired up here because doing so would require a real TLS certificate, which
+#     this phase deliberately does not obtain or generate (see README "TLS / Ingress").
+#   - Both containers run with a read-only root filesystem (read_only: true) plus
+#     explicit tmpfs/volumes for the small number of paths each one actually writes to
+#     at runtime -- verified empirically, not assumed; see README "Container
+#     Hardening" for exactly what was tested and how.
+#   - FORWARDED_ALLOW_IPS is a new, additive setting (uvicorn's own built-in flag, read
+#     from this env var automatically -- see backend/main.py's Dockerfile CMD, which
+#     is UNCHANGED) that tells the backend to trust X-Forwarded-For/X-Forwarded-Proto
+#     from the reverse proxy so rate limiting (IP-keyed) and logging see the real
+#     client, not the proxy's own address. Verified locally against a bare uvicorn
+#     process (README "Networking" has the exact test); NOT verified against a real
+#     reverse proxy container, since none is started by this file.
+#   - The embedding-model cache (HF_HOME, see Dockerfile) is a named volume so the
+#     ~80MB sentence-transformers download only happens once, not on every restart.
+#   - Basic resource limits are set as a starting point -- see README for why these
+#     specific values are placeholders to be tuned, not measured production sizing.
+#
+# What's UNCHANGED from docker-compose.yml (deliberately -- no demonstrated need to
+# change any of this): the CORS/cross-origin browser-to-backend architecture, the
+# session+CSRF cookie design, the API contract, Ollama staying outside this Compose
+# file, and the healthcheck definitions.
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cyber-ai-backend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      CYBER_AI_API_KEY: ${CYBER_AI_API_KEY:?Set CYBER_AI_API_KEY in .env.prod (see .env.prod.example)}
+      CYBER_AI_USERNAME: ${CYBER_AI_USERNAME:?Set CYBER_AI_USERNAME in .env.prod (see .env.prod.example)}
+      CYBER_AI_PASSWORD: ${CYBER_AI_PASSWORD:?Set CYBER_AI_PASSWORD in .env.prod (see .env.prod.example)}
+      OLLAMA_HOST: ${OLLAMA_HOST:?Set OLLAMA_HOST in .env.prod -- see README "Where does the LLM run?"}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS in .env.prod to your real HTTPS origin(s), e.g. https://app.example.com}
+      # Unset (uvicorn's own default of 127.0.0.1) until explicitly configured -- see
+      # README "Networking" for how to determine the correct value for your reverse
+      # proxy. An incorrect value here is a spoofing risk (a client could forge
+      # X-Forwarded-For), so this is intentionally NOT defaulted to something
+      # permissive like "*".
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    volumes:
+      - ./models:/app/models:ro
+      - ./rag/chroma_db:/app/rag/chroma_db
+      - hf_cache:/app/.cache/huggingface
+    read_only: true
+    # No tmpfs beyond the two writable paths above -- verified empirically that the
+    # backend process needs nothing else writable (see README "Container Hardening").
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - cyber-ai-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          # Starting point, not a measured production sizing -- see README "Scaling
+          # Analysis" for what would need to be measured (RSS under real load,
+          # embedding-model + Random Forest memory footprint) before trusting this
+          # number in a real deployment.
+          cpus: "2.0"
+          memory: 2g
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: cyber-ai-frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"
+    environment:
+      # Must be the PUBLIC, browser-facing HTTPS origin of the backend (what the
+      # reverse proxy in front of this stack publishes it as), not this stack's
+      # internal loopback-bound port above -- the browser, not this container, is what
+      # resolves this URL. See .env.prod.example.
+      VITE_API_URL: ${VITE_API_URL:?Set VITE_API_URL in .env.prod to your real HTTPS backend origin, e.g. https://api.example.com}
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /run
+      - /tmp
+    networks:
+      - cyber-ai-net
+    depends_on:
+      backend:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+
+networks:
+  cyber-ai-net:
+    driver: bridge
+
+volumes:
+  # Persists the sentence-transformers embedding-model download across container
+  # restarts/recreations -- without this, a fresh container re-downloads ~80MB from
+  # huggingface.co on first request every time (see README "Persistence & State").
+  hf_cache:

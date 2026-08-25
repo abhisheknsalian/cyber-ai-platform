@@ -41,7 +41,9 @@ Thumbs.db
 data/raw/
 
 # docker-compose.yml reads a root .env by convention (never committed; see
-# .env.example for the placeholder template).
+# .env.example for the placeholder template). docker-compose.prod.yml reads .env.prod
+# the same way (Phase 12) -- see .env.prod.example for its placeholder template.
 .env
 .env.*
 !.env.example
+!.env.prod.example
