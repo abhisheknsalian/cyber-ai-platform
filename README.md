@@ -104,7 +104,10 @@ accumulates stale or duplicate chunks.
 - `POST /analyze` — structured, retrieval-grounded threat analysis (rate-limited)
 - `POST /classify` — DDoS/BENIGN network-traffic classification (Random Forest); see **ML Detection Pipeline** (rate-limited)
 - `GET /ml/feature-importance` — the trained model's own `feature_importances_`, ranked
-- `POST /analyze/classification` — takes an already-computed classifier prediction and runs it through the same RAG pipeline as `/analyze` (rate-limited)
+- `POST /analyze/classification` — takes an already-computed classifier prediction and runs it through the same RAG pipeline as `/analyze` (rate-limited); response now also includes `evidence` (Phase 9)
+- `GET /intelligence/entities` — every entity in the threat graph, optionally filtered by type (Phase 9; see **Threat Intelligence Graph**)
+- `GET /intelligence/graph/{threat_id}` — one threat's direct graph relationships (Phase 9)
+- `POST /intelligence/search` — hybrid (vector + graph) search (Phase 9, rate-limited)
 - `GET /docs` — interactive Swagger UI
 
 `GET /health` response (unchanged since Phase 6):
@@ -351,12 +354,240 @@ raw features:
   "analysis": {
     "threat": "ddos_attack", "severity": "High", "mitre_attack": [{ "id": "T1498", "name": "Network Denial of Service" }],
     "indicators": [...], "mitigations": [...], "sources": [...]
+  },
+  "evidence": {
+    "classifier": { "prediction": "DDoS", "probability": 0.98, "model": "random_forest" },
+    "vector_evidence": [...], "graph_evidence": [...]
   }
 }
 ```
 
-`BENIGN` is a valid, expected prediction -- it returns `"analysis": null` rather than fabricating
-a threat report for non-malicious traffic; the LLM is never called in that case.
+`BENIGN` is a valid, expected prediction -- it returns `"analysis": null, "evidence": null"` rather
+than fabricating a threat report or evidence for non-malicious traffic; the LLM is never called in
+that case. `evidence` is new in Phase 9 -- see **Threat Intelligence Graph** below.
+
+## Threat Intelligence Graph
+
+Phase 9 adds a second, structured intelligence representation alongside the existing vector store
+-- neither replaces the other:
+
+```text
+                    Threat Intelligence Documents (data/threat_intel/*.txt)
+                              |
+                              v
+                    Intelligence Normalizer (backend/intelligence/normalizer.py)
+                              |
+               +--------------+--------------+
+               |                             |
+               v                             v
+        Vector Documents                Threat Graph
+     (Chroma, unchanged --           (entities + relations,
+      backend/rag/ingestion.py)     backend/intelligence/)
+               |                             |
+               +--------------+--------------+
+                              |
+                              v
+                Hybrid Retrieval (backend/intelligence/hybrid_retrieval.py)
+                              |
+                              v
+             Threat Analysis Engine (backend/services/threat_analysis.py)
+                              |
+                              v
+                         Ollama LLM
+```
+
+### Entity model
+
+`backend/intelligence/entities.py` defines five entity types -- Threat, Technique, Indicator,
+Mitigation, Source -- each with a stable, deterministic ID computed from its own text, never
+invented by the LLM and never randomly generated:
+
+```text
+threat:ddos_attack            <- threat_id("ddos_attack")
+mitre:T1498                   <- technique_id("T1498")
+mitigation:rate_limiting      <- mitigation_id("Rate limiting")   (slugified)
+indicator:extremely_high_...  <- indicator_id("Extremely high traffic volume")
+source:ddos_attack.txt        <- source_id("ddos_attack.txt")
+```
+
+The same input text always produces the same ID (see `tests/test_intelligence_entities.py`), which
+is what makes ingestion safe to run twice and lets two threats that happen to list the identical
+mitigation text (e.g. two documents both saying "network monitoring") resolve to one shared entity
+rather than two duplicates.
+
+### Relationship model
+
+Four directed relationship types, each carrying a `reference` back to the source file it was
+derived from -- so every edge, not just every entity, has its own source attribution:
+
+```text
+Threat --USES--------> Technique
+Threat --HAS_INDICATOR-> Indicator
+Threat --MITIGATED_BY-> Mitigation
+Threat --SUPPORTED_BY-> Source
+```
+
+### Graph storage
+
+`backend/intelligence/graph_store.py` -- a plain Pydantic model (`ThreatGraph`: a dict of entities
+keyed by ID, plus a flat relationship list), JSON-serializable, cached in process memory
+(`get_graph()`, the same `@lru_cache(maxsize=1)` singleton pattern `backend/rag/retrieval.py`
+already uses for the vector store/embedding model) and optionally persisted to disk. No Neo4j, no
+Redis, no external service, no network dependency -- deliberately not networkx either: the graph
+here is a few dozen nodes and the only query this project needs ("list a threat's direct
+relationships") is `O(n)` over a flat list, so a graph algorithms library would add a dependency
+without adding capability.
+
+Because building the graph is pure text parsing (no embeddings, no model download, ~1ms for the
+current 5-document knowledge base -- see **Performance** below), it's cheap enough to build lazily
+on first access rather than requiring a separate ingestion step the way the Chroma store does.
+
+### Ingestion
+
+`backend/intelligence/normalizer.py` deterministically parses each `data/threat_intel/*.txt` file's
+existing `Common indicators:` / `MITRE ATT&CK Technique(s):` / `Mitigation strategies:` sections
+(all already present in the source documents used by the existing RAG pipeline -- nothing new was
+written into `data/threat_intel/`) into entities and relationships. No LLM is involved anywhere in
+this module. Running it twice produces a byte-identical graph:
+
+```bash
+uv run python -m backend.intelligence.ingestion
+# Threat graph written to rag/graph/threat_graph.json: 60 entities, 55 relationships
+```
+
+This step is optional -- `get_graph()` builds the same graph in memory automatically on first use.
+It's useful for inspecting the graph as a plain JSON file, or pre-warming it. Like `rag/chroma_db/`,
+the persisted file is a derived build artifact (gitignored, rebuilt from tracked source) and is
+never committed.
+
+### Hybrid retrieval
+
+`backend/intelligence/hybrid_retrieval.py`'s `gather_hybrid_evidence(query)` runs the existing
+vector retrieval unchanged, then looks up the resulting primary threat's graph relationships,
+returning one typed `HybridEvidence` object that keeps vector evidence, graph evidence, and (when
+available) classifier evidence in separate, independently-inspectable fields -- never concatenated
+into an opaque string.
+
+### Evidence-first LLM
+
+The LLM analysis layer's call signature is unchanged (`generate_analysis_fragment(query, context)`
+-- see `backend/services/llm.py`), but `context` is now built by
+`backend/intelligence/evidence_context.py` as clearly labeled sections instead of one block of raw
+retrieved text: *Retrieved Threat Intelligence Context*, *Known Indicators*, *Known Mitigations*,
+*Known MITRE ATT&CK Techniques* (all graph-derived), and -- only for the classifier-driven path --
+*Classifier Evidence*. The system prompt (`SYSTEM_PROMPT` in the same file) was extended with two
+rules: reason over the labeled evidence, and never contradict or override a supplied classifier
+prediction.
+
+**Deterministic, not prompt-hoped-for:** `indicators` and `mitigations` in the final `ThreatAnalysis`
+response are now derived directly from the threat graph (`graph_derived_indicators()` /
+`graph_derived_mitigations()`) whenever the graph has them for that threat, falling back to the
+LLM's own fragment only if it doesn't. `mitre_attack` and `sources` were already deterministic
+(Phase 2) and remain so, untouched. `severity`, `summary`, and `attack_vectors` remain genuinely
+LLM-authored narrative/judgment fields -- the source documents don't enumerate those
+deterministically. `tests/test_classifier_evidence.py` verifies this structurally: it feeds the LLM
+call a mocked, deliberately "hostile" fragment containing fabricated indicators, a fabricated
+mitigation, and a summary claiming a different prediction, then asserts none of that fabricated
+content reaches the response -- `LLMAnalysisFragment` (the LLM's own output schema) has no
+`sources`, `mitre_attack`, `prediction`, or `probability` field at all, so there is structurally no
+way for the model to write any of those values even if it tried.
+
+### Classifier integration
+
+`backend/services/classification.py`'s `classify_and_analyze()` now also resolves the predicted
+threat to its graph entity and attaches the full hybrid evidence bundle to the response (the new,
+additive `evidence` field on `ClassificationAnalysisResponse` -- see the `/analyze/classification`
+example above). The classifier's `prediction`/`probability` come from `ClassificationAnalysisRequest`
+(the Random Forest's own already-validated output, from `POST /classify`) and are passed through
+as-is; nothing in the LLM call path can write to them.
+
+### Source attribution
+
+Every analysis can answer "why did the system reach this conclusion?" from data the backend itself
+computed, never from the LLM:
+
+```text
+Evidence for "How can DDoS attacks be mitigated?":
+- classifier: DDoS, probability 0.98               (backend/ml/predictor.py's own output)
+- graph: DDoS Attack --USES--> T1498                (backend/intelligence/normalizer.py)
+- graph: DDoS Attack --MITIGATED_BY--> Rate limiting (backend/intelligence/normalizer.py)
+- vector: ddos_attack.txt, chunk 3, score 0.5357     (backend/rag/retrieval.py)
+```
+
+### New API endpoints
+
+All follow the existing authentication/rate-limit/error-handling conventions (Phases 5-8) --
+nothing here bypasses them:
+
+| Endpoint | Auth | Rate-limited | Purpose |
+|---|---|---|---|
+| `GET /intelligence/entities` | Public | No | Every graph entity, optionally `?entity_type=threat\|technique\|indicator\|mitigation\|source` |
+| `GET /intelligence/graph/{threat_id}` | Public | No | One threat's direct relationships (404 if unknown) |
+| `POST /intelligence/search` | Required | Yes (shares the `/analyze`/`/classify` AI budget) | Vector search results, each enriched with its threat's graph relationships |
+
+The first two are public/unrated like `GET /threats` -- read-only knowledge-base metadata, not an
+expensive AI operation. `/intelligence/search` runs a real embedding similarity search, so it's
+protected and rate-limited like `/analyze`, and deliberately shares the same rate-limit budget
+rather than opening a second unauthenticated way to hit the embedding model.
+
+### Frontend
+
+The Threat Intelligence page (`frontend/src/pages/ThreatIntelligencePage.tsx`) gained a "View
+relationship graph" toggle per threat card. Expanding it
+(`frontend/src/components/intelligence/ThreatGraphView.tsx`, backed by
+`frontend/src/hooks/useThreatGraph.ts`, calling `GET /intelligence/graph/{threat_id}`) renders a
+simple radial node-link diagram: the threat in the center, its direct relationships as surrounding
+nodes color-coded by entity type, connected by labeled lines -- plain SVG with positions computed
+directly (evenly spaced around a circle), no charting/graph-visualization library added. Verified
+live in a real browser session (see Testing below) against all five threats.
+
+### Performance
+
+Measured locally (`backend/intelligence/graph_store.py` and `hybrid_retrieval.py` log
+`duration_ms` for each stage; see **Observability & Operations** for the logging format):
+
+| Stage | Measured |
+|---|---|
+| Graph build (`get_graph()`, first call) | ~1 ms (60 entities, 55 relationships, pure text parsing) |
+| Graph build (cached, subsequent calls) | 0 ms (`lru_cache` singleton) |
+| Vector retrieval (warm embedding model) | low single-digit ms |
+| Graph evidence lookup for one threat | <1 ms |
+| Hybrid retrieval total (vector + graph) | effectively the vector retrieval cost alone |
+| LLM invocation (Ollama, `llama3.2:3b`) | several seconds -- unchanged, the actual bottleneck |
+
+The graph is never rebuilt per-request (cached singleton); the one deliberate exception is
+`classify_and_analyze()`, which performs vector retrieval twice for a classifier-driven analysis
+(once inside `analyze_query()` for the narrative report, once inside `gather_hybrid_evidence()` for
+the `evidence` field) rather than changing `analyze_query()`'s return type, which `POST /analyze`
+also depends on unchanged. This doubles a millisecond-scale, no-LLM-involved cost on one endpoint;
+it does not double the multi-second LLM call.
+
+### Rebuilding the graph
+
+```bash
+uv run python -m backend.intelligence.ingestion
+```
+
+Not required in normal operation (`get_graph()` builds it automatically), but useful after editing
+`data/threat_intel/*.txt`, or to inspect the graph as JSON at `rag/graph/threat_graph.json`
+(gitignored, override with `THREAT_GRAPH_PATH`).
+
+### Known limitations
+
+- The normalizer's section parser expects this knowledge base's existing structure (a
+  `Common indicators:` bullet list, a `MITRE ATT&CK Technique(s):` block, a
+  `Mitigation(strategies)?:` bullet list) -- adding a 6th threat document in the same style will
+  ingest correctly; a document with a substantially different structure may not.
+  `tests/test_intelligence_normalizer.py` includes a synthetic-document test to make this parsing
+  contract explicit.
+- The graph has no notion of relationship strength/confidence, temporal validity, or provenance
+  beyond "which source file" -- every relationship the normalizer extracts is treated as equally
+  and permanently true.
+- `POST /intelligence/search`'s per-result graph enrichment does one graph lookup per vector
+  match (in-memory, sub-millisecond each) -- fine at this knowledge base's scale, not something
+  that's been measured at a much larger document count.
+- The frontend graph view renders a threat's *direct* relationships only (one hop) -- it does not
+  visualize multi-hop paths (e.g. "which other threats share this same mitigation").
 
 ## Frontend
 
@@ -1056,6 +1287,15 @@ Covered:
 - API-key auth: missing/invalid/malformed `Authorization` header → `401`; valid key → unchanged behavior; a misconfigured (unset) `CYBER_AI_API_KEY` fails closed rather than crashing or running open
 - Session auth: login success/invalid-username/invalid-password/missing-credentials, logout destroys the session, `/auth/me` before and after login, a valid session (+ CSRF header) reaches a protected endpoint, a session without the CSRF header (or with the wrong one) is rejected on state-changing requests
 - Security regression checks: the session cookie is `HttpOnly` or the CSRF cookie is deliberately not, no response body ever contains the password/session token/CSRF token, and none of those values (nor the API key) ever appear in captured log output
+- **Phase 9:** entity/relationship construction and deterministic ID stability; the normalizer's
+  section-parsing against the real 5 documents, a synthetic document, and its idempotence (running
+  ingestion twice produces an identical graph); graph save/load persistence and process-wide
+  caching; hybrid retrieval's vector+graph combination and its typed (not string-concatenated)
+  result; evidence-context formatting as pure functions; the three `/intelligence/*` endpoints'
+  public-vs-protected access, response shapes, and rate-limit sharing with `/analyze`; and,
+  structurally, that a deliberately "hostile" mocked LLM fragment (fabricated indicators, a
+  fabricated mitigation, a summary claiming a different prediction) can never reach the response in
+  place of the real classifier/graph/source evidence
 
 Frontend automated tests were not added in this phase (no test runner existed for `frontend/`
 before it, and adding one — e.g. Vitest + Testing Library — is a separate infrastructure decision
@@ -1076,6 +1316,14 @@ backend/
         embeddings.py        # embedding model loader (cached)
         ingestion.py          # builds/rebuilds the Chroma store from data/threat_intel/
         retrieval.py           # loads the store, relevance-filtered similarity search
+    intelligence/            # Phase 9: structured threat graph alongside the vector store above
+        entities.py            # Entity/Relationship/ThreatGraph models + deterministic ID scheme
+        normalizer.py            # deterministically parses data/threat_intel/*.txt -> entities/relations
+        graph_store.py            # build/save/load/cache (get_graph() -- lazy singleton, like rag/retrieval.py)
+        ingestion.py                # uv run python -m backend.intelligence.ingestion (optional CLI)
+        hybrid_retrieval.py          # combines vector retrieval + graph traversal into typed evidence
+        evidence_context.py           # formats evidence into the LLM's context string; graph-derived indicators/mitigations
+        schemas.py                     # HybridEvidence, ClassifierEvidence, /intelligence/* request/response models
     ml/
         config.py            # FEATURE_COLUMNS (single source of truth), paths, hyperparameters
         preprocessing.py      # cleaning shared by train.py and predictor.py
@@ -1094,19 +1342,21 @@ backend/
 data/threat_intel/         # source threat-intelligence documents
 data/raw/                   # CICIDS2017 CSV goes here (gitignored, not committed)
 models/                      # trained classifier artifact + metadata (gitignored, not committed)
+rag/graph/                    # persisted threat_graph.json (gitignored, Phase 9 -- see Rebuilding the graph)
 notebooks/                 # exploratory notebooks (DDoS classifier, RAG pipeline walkthrough)
-tests/                      # pytest suite (RAG + ML + auth)
+tests/                      # pytest suite (RAG + ML + auth + intelligence)
 frontend/
     src/
-        types/api.ts, ml.ts, auth.ts   # TypeScript types mirroring the backend Pydantic models
+        types/api.ts, ml.ts, auth.ts, intelligence.ts   # TypeScript types mirroring the backend Pydantic models
         services/api.ts                 # the only fetch() call site; typed, error-normalized, sends cookies
         context/AuthContext.tsx          # auth state; calls GET /auth/me on startup, listens for 401s
-        hooks/                            # useHealth, useThreats
+        hooks/                            # useHealth, useThreats, useThreatGraph
         components/
             layout/              # AppShell, Sidebar (incl. logout button)
             common/               # Card, PageHeader, SeverityBadge, StatusPill
             dashboard/            # StatCard
             analysis/             # QueryInput, SampleQueries, LoadingState, AnalysisResult, ...
+            intelligence/          # ThreatGraphView -- Phase 9 radial relationship diagram (plain SVG)
         pages/                  # LoginPage, DashboardPage, ThreatAnalysisPage, NetworkDetectionPage, ThreatIntelligencePage, AboutPage
         App.tsx                 # router + auth gate
     public/config.js            # local-dev runtime-config fallback (window.__APP_CONFIG__ = {})

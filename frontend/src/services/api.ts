@@ -1,5 +1,6 @@
 import type { AnalyzeRequest, HealthResponse, ThreatAnalysis, ThreatCategory } from "../types/api";
 import type { AuthStatusResponse, LoginRequest } from "../types/auth";
+import type { ThreatGraphNeighborhood } from "../types/intelligence";
 import type {
   ClassificationAnalysisRequest,
   ClassificationAnalysisResponse,
@@ -159,4 +160,9 @@ export function analyzeClassification(
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+/** Public endpoint (Phase 9) -- no auth/CSRF required, same as getThreats(). */
+export function getThreatGraph(threatId: string): Promise<ThreatGraphNeighborhood> {
+  return request<ThreatGraphNeighborhood>(`/intelligence/graph/${encodeURIComponent(threatId)}`);
 }

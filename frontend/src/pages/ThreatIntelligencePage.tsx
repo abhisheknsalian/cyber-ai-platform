@@ -1,9 +1,11 @@
-import { Bug, Database, Lock, Mail, Network, ShieldAlert, Zap } from "lucide-react";
+import { Bug, ChevronDown, Database, Lock, Mail, Network, ShieldAlert, Zap } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { useState } from "react";
 
 import { Card } from "../components/common/Card";
 import { PageHeader } from "../components/common/PageHeader";
 import { StatusPill } from "../components/common/StatusPill";
+import { ThreatGraphView } from "../components/intelligence/ThreatGraphView";
 import { useThreats } from "../hooks/useThreats";
 
 const ICONS: Record<string, LucideIcon> = {
@@ -23,6 +25,7 @@ function formatThreatType(threatType: string): string {
 
 export function ThreatIntelligencePage() {
   const { threats, loading, error } = useThreats();
+  const [expanded, setExpanded] = useState<string | null>(null);
 
   return (
     <div>
@@ -47,6 +50,7 @@ export function ThreatIntelligencePage() {
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {threats.map((threat) => {
             const Icon = ICONS[threat.threat_type] ?? ShieldAlert;
+            const isExpanded = expanded === threat.threat_type;
             return (
               <Card key={threat.threat_type} className="p-5">
                 <div className="flex items-start justify-between gap-3">
@@ -58,6 +62,21 @@ export function ThreatIntelligencePage() {
                 </div>
                 <p className="mt-3 text-sm leading-relaxed text-text-muted">{threat.description}</p>
                 <p className="mt-3 font-mono text-xs text-text-faint">{threat.source}</p>
+
+                <button
+                  type="button"
+                  onClick={() => setExpanded(isExpanded ? null : threat.threat_type)}
+                  className="mt-4 flex w-full items-center justify-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-text-muted transition-colors hover:border-border-strong hover:bg-surface-hover hover:text-text"
+                >
+                  <ChevronDown className={`h-3.5 w-3.5 transition-transform ${isExpanded ? "rotate-180" : ""}`} strokeWidth={1.75} />
+                  {isExpanded ? "Hide relationship graph" : "View relationship graph"}
+                </button>
+
+                {isExpanded && (
+                  <div className="mt-4 border-t border-border pt-4">
+                    <ThreatGraphView threatId={threat.threat_type} />
+                  </div>
+                )}
               </Card>
             );
           })}

@@ -3,6 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
+from backend.intelligence.schemas import HybridEvidence
 from backend.ml.config import FEATURE_COLUMNS
 from backend.models.schemas import ThreatAnalysis
 
@@ -62,3 +63,8 @@ class ClassificationAnalysisResponse(BaseModel):
     # None when classification == "benign": there is no threat to analyze, and a
     # RAG report is never fabricated for non-malicious traffic.
     analysis: ThreatAnalysis | None = None
+    # Phase 9, additive: the hybrid evidence bundle backing `analysis` -- classifier
+    # prediction/probability, vector matches, and graph relationships, all backend-
+    # computed. None whenever `analysis` is None (nothing to attribute). Existing
+    # clients that only read `classification`/`analysis` are unaffected by this field.
+    evidence: HybridEvidence | None = None

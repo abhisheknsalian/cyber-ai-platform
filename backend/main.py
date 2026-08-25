@@ -9,6 +9,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.config_validation import ConfigurationError, validate_startup_config
+from backend.intelligence.graph_store import get_graph
+from backend.intelligence.hybrid_retrieval import gather_hybrid_evidence, graph_neighborhood
+from backend.intelligence.schemas import (
+    EntitySummary,
+    GraphEvidenceItem,
+    IntelligenceSearchRequest,
+    IntelligenceSearchResult,
+    ThreatGraphNeighborhood,
+)
 from backend.logging_config import configure_logging
 from backend.middleware import RequestContextMiddleware, SecurityHeadersMiddleware
 from backend.ml.predictor import ModelUnavailableError, feature_importance, model_available, predict
@@ -229,6 +238,92 @@ def threats() -> list[ThreatCategory]:
     return list_threat_categories()
 
 
+@app.get("/intelligence/entities", response_model=list[EntitySummary])
+def intelligence_entities(entity_type: str | None = None) -> list[EntitySummary]:
+    """Every entity in the threat-intelligence graph (Phase 9), optionally filtered
+    to one entity type (threat/technique/indicator/mitigation/source). Public and
+    read-only, like GET /threats -- this is knowledge-base metadata derived
+    deterministically from data/threat_intel/*.txt, not a protected or expensive AI
+    operation, so it follows /threats' convention rather than /analyze's."""
+    entities = get_graph().entities.values()
+    if entity_type is not None:
+        entities = [e for e in entities if e.type == entity_type]
+    return [EntitySummary(id=e.id, type=e.type, name=e.name) for e in entities]
+
+
+@app.get("/intelligence/graph/{threat_id}", response_model=ThreatGraphNeighborhood)
+def intelligence_graph(threat_id: str) -> ThreatGraphNeighborhood:
+    """One threat's direct graph relationships (Phase 9) -- e.g. threat_id=
+    "ddos_attack" returns the DDoS Attack entity plus its USES/HAS_INDICATOR/
+    MITIGATED_BY/SUPPORTED_BY edges. Public, like GET /threats. Takes the plain
+    filename stem (e.g. "ddos_attack"), not the "threat:ddos_attack" internal ID --
+    matching /threats' `threat_type` field so the frontend can link the two directly.
+    """
+    neighborhood = graph_neighborhood(threat_id)
+    if neighborhood is None:
+        raise HTTPException(status_code=404, detail=f"No threat entity found for {threat_id!r}.")
+    return neighborhood
+
+
+@app.post("/intelligence/search", response_model=list[IntelligenceSearchResult])
+def intelligence_search(
+    request: IntelligenceSearchRequest,
+    _: None = Depends(enforce_ai_rate_limit),
+    __: None = Depends(require_auth),
+) -> list[IntelligenceSearchResult]:
+    """Hybrid search (Phase 9): vector-relevant chunks, each enriched with its own
+    threat's direct graph relationships. Protected + rate-limited like /analyze (not
+    public like the two endpoints above) because, like /analyze, it runs a real
+    embedding similarity search per request."""
+    if not vector_store_available():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Vector store not found. Build it first with: "
+                "uv run python -m backend.rag.ingestion"
+            ),
+        )
+    try:
+        evidence = gather_hybrid_evidence(request.query)
+    except Exception:
+        logger.exception("Unexpected error during intelligence search", extra={"event": "intelligence_search_error"})
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while searching.",
+        )
+
+    results: list[IntelligenceSearchResult] = []
+    for item in evidence.vector_evidence:
+        # Graph evidence in `evidence` above is only computed for the single overall
+        # "primary" threat -- for a genuinely mixed-topic result set, each row here
+        # looks up its own threat_type's relations directly rather than reusing that.
+        neighborhood = graph_neighborhood(item.threat_type)
+        graph_relations = (
+            [
+                GraphEvidenceItem(
+                    relation=relation.relation,
+                    target_id=relation.target.id,
+                    target_name=relation.target.name,
+                    target_type=relation.target.type,
+                    reference=relation.reference,
+                )
+                for relation in neighborhood.relations
+            ]
+            if neighborhood is not None
+            else []
+        )
+        results.append(
+            IntelligenceSearchResult(
+                source=item.source,
+                threat_type=item.threat_type,
+                chunk_index=item.chunk_index,
+                score=item.score,
+                graph_relations=graph_relations,
+            )
+        )
+    return results
+
+
 @app.post("/analyze", response_model=ThreatAnalysis)
 def analyze_threat(
     request: AnalyzeRequest,
@@ -332,8 +427,8 @@ def analyze_classification(
     re-run the classifier -- it only maps a given prediction to a threat report.
     """
     try:
-        classification, analysis = classify_and_analyze(request)
-        return ClassificationAnalysisResponse(classification=classification, analysis=analysis)
+        classification, analysis, evidence = classify_and_analyze(request)
+        return ClassificationAnalysisResponse(classification=classification, analysis=analysis, evidence=evidence)
     except UnsupportedPredictionError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except VectorStoreUnavailableError:

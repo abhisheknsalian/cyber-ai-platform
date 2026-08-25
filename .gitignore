@@ -12,6 +12,11 @@ __pycache__/
 rag/chroma_db/
 rag/multi_threat_db/
 
+# Threat graph (Phase 9) -- deterministically rebuilt from data/threat_intel/*.txt
+# via `uv run python -m backend.intelligence.ingestion`, same pattern as chroma_db/
+# above. Not required at runtime either -- get_graph() builds it in memory on demand.
+rag/graph/
+
 # Trained ML model artifacts
 models/
 

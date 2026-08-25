@@ -2,6 +2,13 @@ import logging
 import re
 import time
 
+from backend.intelligence.evidence_context import (
+    build_evidence_context,
+    graph_derived_indicators,
+    graph_derived_mitigations,
+)
+from backend.intelligence.hybrid_retrieval import graph_evidence_for_threat
+from backend.intelligence.schemas import ClassifierEvidence
 from backend.models.schemas import MitreTechnique, SourceRef, ThreatAnalysis
 from backend.rag.config import RAG_SCORE_THRESHOLD, RAG_TOP_K, THREAT_INTEL_DIR
 from backend.rag.retrieval import retrieve_relevant, vector_store_available
@@ -40,7 +47,15 @@ def _extract_mitre_techniques(source_filenames: set[str]) -> list[MitreTechnique
     return list(seen.values())
 
 
-def analyze_query(query: str) -> ThreatAnalysis:
+def analyze_query(query: str, *, classifier: ClassifierEvidence | None = None) -> ThreatAnalysis:
+    """classifier: optional evidence from a prior classifier prediction (see
+    backend/services/classification.py's classify_and_analyze()). When present, it is
+    included as a labeled, deterministic section of the LLM's context (see
+    backend/intelligence/evidence_context.py) -- the LLM may explain it but the
+    prediction/probability values themselves come only from this argument, never from
+    the LLM's own output, which has no field for them (backend/models/schemas.py's
+    LLMAnalysisFragment). Plain /analyze calls this with classifier=None, so its
+    existing behavior (Phase 2-8) is unchanged."""
     if not vector_store_available():
         raise VectorStoreUnavailableError("Vector store has not been built yet")
 
@@ -84,11 +99,27 @@ def analyze_query(query: str) -> ThreatAnalysis:
         for doc, score in primary_chunks
     ]
     mitre = _extract_mitre_techniques({s.source for s in sources})
-    context = "\n\n".join(doc.page_content for doc, _score in primary_chunks)
+
+    # Graph evidence for the primary threat (Phase 9) -- deterministic, derived from
+    # data/threat_intel/*.txt via backend/intelligence/normalizer.py, never from the
+    # LLM. Empty for a threat the graph doesn't know about (defensive; in practice
+    # every threat_type this KB produces is also in the graph).
+    graph_start = time.perf_counter()
+    graph_evidence = graph_evidence_for_threat(primary_threat)
+    graph_duration_ms = round((time.perf_counter() - graph_start) * 1000, 2)
+
+    retrieved_text = "\n\n".join(doc.page_content for doc, _score in primary_chunks)
+    context = build_evidence_context(retrieved_text=retrieved_text, graph_evidence=graph_evidence, classifier=classifier)
 
     logger.info(
         "RAG primary threat selected",
-        extra={"event": "rag_threat_selected", "threat": primary_threat, "source_count": len(sources)},
+        extra={
+            "event": "rag_threat_selected",
+            "threat": primary_threat,
+            "source_count": len(sources),
+            "graph_relation_count": len(graph_evidence),
+            "graph_duration_ms": graph_duration_ms,
+        },
     )
 
     fragment = generate_analysis_fragment(query, context)
@@ -101,6 +132,16 @@ def analyze_query(query: str) -> ThreatAnalysis:
             sources=sources,
         )
 
+    # Indicators/mitigations are now deterministically derived from the threat graph
+    # when it has them (which it does for every threat this knowledge base produces),
+    # falling back to the LLM's own (context-grounded, as before) fragment only if the
+    # graph has none for this threat -- structurally, not just by prompt instruction,
+    # satisfying "must not invent indicators/mitigations that aren't present in
+    # evidence". attack_vectors and severity remain LLM-authored: they're genuinely
+    # narrative/judgment fields the source documents don't enumerate deterministically.
+    indicators = graph_derived_indicators(graph_evidence) or fragment.indicators
+    mitigations = graph_derived_mitigations(graph_evidence) or fragment.mitigations
+
     return ThreatAnalysis(
         query=query,
         status="analyzed",
@@ -109,7 +150,7 @@ def analyze_query(query: str) -> ThreatAnalysis:
         summary=fragment.summary,
         attack_vectors=fragment.attack_vectors,
         mitre_attack=mitre,
-        indicators=fragment.indicators,
-        mitigations=fragment.mitigations,
+        indicators=indicators,
+        mitigations=mitigations,
         sources=sources,
     )
