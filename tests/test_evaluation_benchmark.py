@@ -36,8 +36,32 @@ _STAGE_NAMES = {
 
 
 def test_pipeline_benchmark_produces_every_expected_stage():
-    with patch("backend.evaluation.benchmark.generate_analysis_fragment", return_value=_FRAGMENT):
+    # Two independent call sites need mocking, not one: benchmark.py's own isolated
+    # generate_analysis_fragment call (the llm_analysis stage) AND the real one inside
+    # classify_and_analyze() -> analyze_query(), which imports the same function into
+    # backend.services.threat_analysis's own namespace (see that module's import) for
+    # the total_classify_and_analyze stage -- patching only the first left the second
+    # a real, unmocked network call, which happened to succeed silently in any
+    # environment with a real local Ollama server and only surfaced as a failure in
+    # CI/environments without one. Same two-target pattern tests/test_ml_integration.py
+    # already established for exactly this reason.
+    with (
+        patch("backend.evaluation.benchmark.generate_analysis_fragment", return_value=_FRAGMENT) as mocked_local,
+        patch("backend.services.threat_analysis.generate_analysis_fragment", return_value=_FRAGMENT) as mocked_pipeline,
+    ):
         result = run_pipeline_benchmark(sample_size=2)
+
+    # Regression guard for the exact bug this double-patch fixes: if either call site
+    # were ever unmocked again, this would either fail here (call_count == 0) or, if
+    # Ollama happens to be reachable, mask the gap the same way it did before -- so
+    # this alone isn't a complete guard, but it does prove both sites were actually
+    # exercised by this test run, not just one silently skipped in environments with
+    # a real local Ollama server.
+    # mocked_local: one warm-up call + one per sampled row (see run_pipeline_benchmark).
+    # mocked_pipeline: one per sampled row -- only reached via classify_and_analyze(),
+    # which the warm-up step deliberately bypasses.
+    assert mocked_local.call_count == 3
+    assert mocked_pipeline.call_count == 2
 
     assert {s.stage for s in result.stages} == _STAGE_NAMES
     assert result.queries_evaluated == 2
@@ -77,8 +101,16 @@ def test_pipeline_benchmark_stages_are_json_serializable_numeric_data_only():
         indicators=["fabricated-indicator"],
         mitigations=["fabricated-mitigation"],
     )
-    with patch("backend.evaluation.benchmark.generate_analysis_fragment", return_value=hostile_fragment):
+    # Both call sites mocked -- see test_pipeline_benchmark_produces_every_expected_stage
+    # for why one alone isn't enough.
+    with (
+        patch("backend.evaluation.benchmark.generate_analysis_fragment", return_value=hostile_fragment) as mocked_local,
+        patch("backend.services.threat_analysis.generate_analysis_fragment", return_value=hostile_fragment) as mocked_pipeline,
+    ):
         result = run_pipeline_benchmark(sample_size=1)
+
+    assert mocked_local.call_count == 2  # one warm-up call + one sampled row
+    assert mocked_pipeline.call_count == 1  # reached only via classify_and_analyze()
 
     dumped = result.model_dump()
     serialized = str(dumped)

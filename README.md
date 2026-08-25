@@ -2,34 +2,75 @@
 
 [![CI](https://github.com/abhisheknsalian/cyber-ai-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/abhisheknsalian/cyber-ai-platform/actions/workflows/ci.yml)
 
-A local, retrieval-augmented cybersecurity threat-intelligence analysis platform: a React
-dashboard backed by a FastAPI service. The backend embeds a small knowledge base of threat
-write-ups (`data/threat_intel/*.txt`) into a Chroma vector store and uses a locally-running
-Llama 3.2 model (via [Ollama](https://ollama.com)) to turn a natural-language question into a
-**validated, structured JSON threat analysis** with source attribution. A separate Random
-Forest classifier (trained offline on CICIDS2017-style network flow data) can also score a
-traffic sample as BENIGN/DDoS and feed that prediction into the same RAG pipeline. See
-**ML Detection Pipeline** below.
+A local, retrieval-augmented cybersecurity threat-intelligence platform: a React dashboard backed by
+a FastAPI service that combines a real, dataset-trained network-traffic classifier, a deterministic
+threat-intelligence knowledge graph, vector retrieval over a small curated knowledge base, and a
+locally-running LLM (via [Ollama](https://ollama.com)) — with the LLM structurally unable to
+override any deterministic fact (classifier prediction, MITRE technique ID, source attribution) it's
+given. A companion evaluation layer produces reproducible, methodology-transparent metrics for the
+classifier, the retrieval paths, and the end-to-end pipeline. A documented (not deployed) production
+architecture covers TLS, container hardening, scaling limits, and failure behavior. See the sections
+below for exactly what's implemented, what's designed-only, and what remains unverified — this
+README does not blur that line anywhere.
+
+## Key Capabilities
+
+| Area | Capability |
+|---|---|
+| ML detection | Random Forest classifier trained on real CICIDS2017 network-flow data (BENIGN/DDoS); duplicate-removal leakage fix; multi-class-*ready* schema/metrics architecture (no additional class trained — see **ML Detection Pipeline**) |
+| RAG | Chroma + sentence-transformers vector retrieval over a curated knowledge base, with a relevance threshold that keeps out-of-domain queries from ever reaching the LLM (see **Relevance Filtering**) |
+| Threat intelligence graph | Deterministic, one-hop entity/relationship graph built from the same source documents — no LLM involved in graph construction (see **Threat Intelligence Graph**) |
+| Hybrid retrieval | Combines vector and graph evidence into one typed, evidence-first LLM context (see **Threat Intelligence Graph** > "Hybrid retrieval") |
+| Evidence integrity | The LLM's own output schema has no field for prediction/probability/MITRE ID/source — structurally, not just by prompt instruction, it cannot override them (see **Classifier integration**) |
+| Authentication | API-key + browser session (HttpOnly cookie + CSRF double-submit), both fail closed (see **Authentication**) |
+| Operational hardening | Rate limiting, request IDs, structured JSON logging, security headers, health/readiness separation (see **Observability & Operations**) |
+| Evaluation | Reproducible held-out/full-dataset metrics, threshold and calibration analysis, retrieval coverage benchmark, per-stage pipeline latency (see **Evaluation & Benchmarking**) |
+| Deployment architecture | Hardened Docker images, a production Compose profile, and a documented (not deployed) single-VM + reverse-proxy architecture (see **Production Deployment Architecture**) |
 
 ## Architecture
 
-```text
-React dashboard (Vite + TypeScript + Tailwind)
-   → FastAPI (POST /analyze, GET /health, GET /threats, POST /classify, POST /analyze/classification)
-   → relevance-filtered retrieval (ChromaDB + HuggingFace embeddings)
-   → deterministic threat-type identification + MITRE ATT&CK extraction (from source docs)
-   → structured LLM generation (Ollama / Llama 3.2, JSON-schema constrained)
-   → validated Pydantic response with source attribution
-   → React
+```mermaid
+flowchart LR
+    UI["React dashboard<br/>(Vite + TypeScript + Tailwind)"]
 
-Network Traffic Features (CICFlowMeter-style)
-   → Random Forest (backend/ml/) → BENIGN / DDoS prediction
-   → same threat-identification + RAG + LLM pipeline above → structured threat report
+    subgraph API["FastAPI backend"]
+        direction TB
+        Auth["Auth<br/>API key / session + CSRF"]
+        Classify["POST /classify<br/>Random Forest"]
+        Analyze["POST /analyze<br/>POST /analyze/classification"]
+        Search["POST /intelligence/search"]
+    end
+
+    Vector[("Chroma vector store<br/>sentence-transformers")]
+    Graph[("Threat graph<br/>deterministic, in-memory")]
+    LLM["Ollama<br/>Llama 3.2"]
+
+    UI -->|cross-origin, credentialed| API
+    Classify -->|"BENIGN / DDoS + probability"| Analyze
+    Analyze --> Vector
+    Analyze --> Graph
+    Search --> Vector
+    Search --> Graph
+    Vector -->|"retrieved chunks"| LLM
+    Graph -->|"indicators, mitigations, classifier evidence<br/>(labeled, LLM cannot override)"| LLM
+    LLM -->|"narrative fields only<br/>(severity, summary, attack_vectors)"| Analyze
+    Analyze -->|"validated Pydantic response"| UI
+
+    classDef det fill:#0891b2,stroke:#0e7490,color:#fff
+    classDef llm fill:#dc2626,stroke:#991b1b,color:#fff
+    class Vector,Graph,Classify det
+    class LLM llm
 ```
 
-Out-of-domain or unsupported queries never reach the LLM at all: if nothing in the knowledge
-base is actually relevant, the API returns a `no_relevant_intelligence` result directly from the
-retrieval layer. See **Relevance Filtering** below.
+Deterministic components (blue) — the classifier, vector retrieval, and the graph — produce every
+fact that ends up in a response. The LLM (red) contributes only narrative fields it has no schema
+field to smuggle a fact into (see **Threat Intelligence Graph** > "Evidence-first LLM"). Out-of-domain
+or unsupported queries never reach the LLM at all: if nothing in the knowledge base is actually
+relevant, the API returns a `no_relevant_intelligence` result directly from the retrieval layer. See
+**Relevance Filtering** below.
+
+For the deployment-level view (containers, networks, trust boundaries, what's public vs. private),
+see **Production Deployment Architecture** > "Architecture diagram" further down.
 
 ## Requirements
 
@@ -97,18 +138,19 @@ accumulates stale or duplicate chunks.
 
 ## Backend Endpoints
 
-- `GET /` — basic liveness message
-- `GET /health` — process/application health (does not run LLM inference — see below)
-- `GET /ready` — readiness: whether RAG/classifier/LLM dependencies are actually available (Phase 8; see **Observability & Operations** > "Health vs Readiness")
-- `GET /threats` — threat categories discovered from `data/threat_intel/*.txt`, for the frontend
-- `POST /analyze` — structured, retrieval-grounded threat analysis (rate-limited)
-- `POST /classify` — DDoS/BENIGN network-traffic classification (Random Forest); see **ML Detection Pipeline** (rate-limited)
-- `GET /ml/feature-importance` — the trained model's own `feature_importances_`, ranked
-- `POST /analyze/classification` — takes an already-computed classifier prediction and runs it through the same RAG pipeline as `/analyze` (rate-limited); response now also includes `evidence` (Phase 9)
-- `GET /intelligence/entities` — every entity in the threat graph, optionally filtered by type (Phase 9; see **Threat Intelligence Graph**)
-- `GET /intelligence/graph/{threat_id}` — one threat's direct graph relationships (Phase 9)
-- `POST /intelligence/search` — hybrid (vector + graph) search (Phase 9, rate-limited)
-- `GET /docs` — interactive Swagger UI
+- `GET /` — basic liveness message (public)
+- `GET /health` — process/application health (does not run LLM inference — see below) (public)
+- `GET /ready` — readiness: whether RAG/classifier/LLM dependencies are actually available (Phase 8; see **Observability & Operations** > "Health vs Readiness") (public)
+- `GET /threats` — threat categories discovered from `data/threat_intel/*.txt`, for the frontend (public)
+- `POST /analyze` — structured, retrieval-grounded threat analysis (protected, rate-limited)
+- `POST /classify` — DDoS/BENIGN network-traffic classification (Random Forest); see **ML Detection Pipeline** (protected, rate-limited)
+- `GET /ml/feature-importance` — the trained model's own `feature_importances_`, ranked (protected, not rate-limited — see **Observability & Operations** > "Rate limiting")
+- `POST /analyze/classification` — takes an already-computed classifier prediction and runs it through the same RAG pipeline as `/analyze` (protected, rate-limited); response now also includes `evidence` (Phase 9)
+- `GET /intelligence/entities` — every entity in the threat graph, optionally filtered by type (Phase 9; see **Threat Intelligence Graph**) (public)
+- `GET /intelligence/graph/{threat_id}` — one threat's direct graph relationships (Phase 9) (public)
+- `POST /intelligence/search` — hybrid (vector + graph) search (Phase 9; protected, rate-limited)
+- `GET /docs` — interactive Swagger UI (public)
+- `POST /auth/login`, `POST /auth/logout`, `GET /auth/me` — see **Authentication** below (login is rate-limited; all three are public — session/API-key auth is what they exist to provide, not what protects them)
 
 `GET /health` response (unchanged since Phase 6):
 
@@ -734,11 +776,13 @@ startup log ever prints a secret's actual value, only whether it's configured.
 
 ## Authentication
 
-`POST /analyze`, `POST /classify`, `GET /ml/feature-importance`, and `POST /analyze/classification`
-require authentication. `GET /`, `GET /health`, `GET /ready`, `GET /threats`, and `GET/POST /auth/*`
-stay public (though `POST /auth/login` and the four endpoints above are rate-limited — see
-**Observability & Operations**). There are two independent credential paths, either of which
-satisfies a protected request:
+`POST /analyze`, `POST /classify`, `GET /ml/feature-importance`, `POST /analyze/classification`, and
+`POST /intelligence/search` (Phase 9) require authentication. `GET /`, `GET /health`, `GET /ready`,
+`GET /threats`, `GET /intelligence/entities`, `GET /intelligence/graph/{threat_id}`, and
+`GET`/`POST /auth/*` stay public (though `POST /auth/login` and four of the five protected endpoints
+above are rate-limited — see **Observability & Operations** > "Rate limiting" for exactly which one
+isn't and why). There are two independent credential paths, either of which satisfies a protected
+request:
 
 ```text
 Direct API client:  Authorization: Bearer <CYBER_AI_API_KEY>  ─┐
@@ -899,16 +943,20 @@ silently break the real application.
 ### Rate limiting
 
 An in-memory sliding-window limiter (`backend/rate_limit.py`) protects the highest-risk endpoints:
-`POST /auth/login` (`RATE_LIMIT_LOGIN_MAX`/`_WINDOW_SECONDS`, default 5 per 60s) and the three AI
-endpoints `POST /analyze` / `POST /classify` / `POST /analyze/classification`, which **share one
-budget** (`RATE_LIMIT_AI_MAX`/`_WINDOW_SECONDS`, default 20 per 60s combined) so a caller can't
-multiply their effective quota by switching endpoints. Keyed by client IP only — **never by
-username or API key** — specifically because rate-limiting login by the attempted username would
-let an attacker distinguish "this username exists and got throttled" from "this username doesn't
-exist," reopening exactly the enumeration channel the generic "Invalid username or password" error
-already closes. Exceeding a limit returns `429` with a `Retry-After` header and a generic message;
-the response body never reveals hit counts or any other client's state. Public endpoints (`/`,
-`/health`, `/ready`, `/threats`, `GET /auth/me`, `POST /auth/logout`) are never rate-limited.
+`POST /auth/login` (`RATE_LIMIT_LOGIN_MAX`/`_WINDOW_SECONDS`, default 5 per 60s) and the four AI
+endpoints `POST /analyze` / `POST /classify` / `POST /analyze/classification` / `POST
+/intelligence/search` (Phase 9), which **share one budget** (`RATE_LIMIT_AI_MAX`/`_WINDOW_SECONDS`,
+default 20 per 60s combined) so a caller can't multiply their effective quota by switching
+endpoints. Keyed by client IP only — **never by username or API key** — specifically because
+rate-limiting login by the attempted username would let an attacker distinguish "this username
+exists and got throttled" from "this username doesn't exist," reopening exactly the enumeration
+channel the generic "Invalid username or password" error already closes. Exceeding a limit returns
+`429` with a `Retry-After` header and a generic message; the response body never reveals hit counts
+or any other client's state. `GET /ml/feature-importance` requires authentication (see **Authentication**) but, verified against
+`backend/main.py`, is not wired to this rate limiter -- unlike the four endpoints above, it neither
+retrieves nor runs the model, only reads its already-computed `feature_importances_`.
+Public endpoints (`/`, `/health`, `/ready`, `/threats`, `GET /auth/me`, `POST /auth/logout`,
+`GET /intelligence/entities`, `GET /intelligence/graph/{threat_id}`) are never rate-limited.
 
 No account lockout was added deliberately: a lockout that a remote, unauthenticated caller can
 trigger by attempting a known username with wrong passwords is itself a denial-of-service vector
@@ -1716,6 +1764,34 @@ disk -- acceptable for a single-operator VM, not for a team), and log-aggregatio
 of these decisions were made in this phase, since making any of them would mean picking (and
 implicitly depending on) a specific cloud provider without a demonstrated reason to prefer one.
 
+## Security Checklist
+
+A single scannable summary of security posture across the application and its deployment
+architecture. Every row links to the section with the full detail and reasoning — this table
+doesn't introduce anything new, it consolidates what's already documented elsewhere in this README.
+
+| Area | Status | Detail |
+|---|---|---|
+| API-key authentication | **Implemented** | Constant-time comparison, never logged/echoed — **Authentication** |
+| Browser session authentication | **Implemented** | In-memory, opaque random token, 12h TTL — **Authentication** |
+| Session cookies | **Implemented** | `HttpOnly`, `Secure`, `SameSite=None` — **Authentication**, **Production Deployment Architecture** > "Networking" |
+| CSRF protection | **Implemented** | Double-submit cookie pattern on state-changing requests — **Authentication** |
+| CORS | **Implemented** | Explicit allowlist, wildcard rejected when combined with credentials — **Configuration**, `backend/config_validation.py` |
+| Rate limiting | **Implemented** (single-process) | IP-keyed sliding window; not distributed across replicas — **Observability & Operations**, **Production Deployment Architecture** > "Scaling Analysis" |
+| Request IDs | **Implemented** | Correlation ID on every request/response/log line — **Observability & Operations** |
+| Structured logging | **Implemented** | JSON lines to stdout; secrets never logged by convention — **Observability & Operations** |
+| Placeholder-credential detection | **Implemented** | Startup warning if a credential still matches `.env.example`'s literal placeholder — **Production Deployment Architecture** > "Secrets & Configuration" |
+| Container non-root execution | **Implemented** | Both images already ran as non-root before this phase — **Container Hardening** |
+| Read-only container filesystem | **Implemented** (frontend, live-verified) / **Designed** (backend, audited not live-run) | **Container Hardening** |
+| Health vs. readiness separation | **Implemented** | `/health` never reflects dependency state; `/ready` does — **Observability & Operations** > "Health vs Readiness" |
+| Security response headers | **Implemented** | `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, CSP (API paths) — **Observability & Operations** |
+| TLS termination | **Designed, not deployed** | Example reverse-proxy config only, no real certificate — **TLS / Ingress** |
+| Proxy-header trust (`FORWARDED_ALLOW_IPS`) | **Implemented, verified against a bare process** / **not verified against a real proxy** | **Production Deployment Architecture** > "Networking" |
+| Public vs. protected endpoints | **Implemented, audited this phase** | See **Backend Endpoints** and **Authentication** for the exact current list |
+| Model/dataset artifact handling | **Implemented** | Real dataset/model/vector-store/graph never tracked in git — **Reproducibility** below |
+| Error responses | **Implemented** | Generic client-facing message, full traceback server-side only — **Observability & Operations** |
+| Secret storage in production | **Designed, not verified** | `.env.prod`, gitignored, operator-held — no secret manager integration exists or is referenced |
+
 ## CI/CD
 
 `.github/workflows/ci.yml` runs automatically on every push to `main` and every pull request
@@ -1724,7 +1800,7 @@ correct — nothing more. Three independent jobs:
 
 | Job | Steps | Validates |
 |---|---|---|
-| `backend-tests` | checkout → `astral-sh/setup-uv` → `uv sync --frozen` → `uv run pytest tests/ -v` | The backend test suite (currently 78 tests) |
+| `backend-tests` | checkout → `astral-sh/setup-uv` → `uv sync --frozen` → `uv run pytest tests/ -v` | The backend test suite (currently 285 tests) |
 | `frontend-quality` | checkout → `actions/setup-node` (Node 22) → `npm ci` → `npm run lint` → `npm run build` | The frontend lints and builds cleanly |
 | `docker-build` | checkout → `docker build -t cyber-ai-backend .` → `docker build -t cyber-ai-frontend ./frontend` | Both images are reproducibly buildable from tracked source |
 
@@ -1859,6 +1935,29 @@ missing prerequisite degrades that one report section to `null` plus a plain-Eng
 `evaluation/latest.json` by default (gitignored, same pattern as `rag/chroma_db/`, `rag/graph/`,
 `models/` — reproducible on demand, not a committed artifact).
 
+**Results table** — the exact figures produced by the commands above against the real local dataset
+and model in this development environment; not re-derived or rounded for this table. Every row
+below is explained in detail further down this section.
+
+| Scope | Metric | Value | What it means |
+|---|---|---|---|
+| ML — held-out test (44,617 rows never used in training) | Accuracy | `0.9999103` | Held-out, not training-set — a true generalization estimate on this binary dataset |
+| | Macro F1 | `0.9999084` | |
+| | ROC-AUC | `0.99999985` | |
+| | PR-AUC | `0.99999988` | |
+| ML — calibration (held-out) | Brier score | `0.000108` | Lower is better; near-zero reflects a highly separable binary problem, not universal calibration quality |
+| ML — threshold analysis | Best-F1 threshold | `0.4` | Identified for analysis only — **not applied** to production, which stays at the default `0.5` |
+| Retrieval — 6-query sanity benchmark | Topic coverage | `1.0` | Not a formal IR benchmark — see "Retrieval evaluation is coverage, not accuracy" below |
+| | Hybrid evidence preservation | `1.0` | Every hybrid result retained both vector and graph evidence |
+| Pipeline latency | Classifier inference | `~5–6ms` | Isolated per-stage timings (see `pipeline.note` in the JSON report for exact accounting) |
+| | Vector retrieval | `~5–45ms` | |
+| | Graph retrieval | `<1ms` | |
+| | Hybrid retrieval | `~4–6ms` | |
+| | LLM analysis | `~2.6–2.7s` | The dominant cost by roughly two orders of magnitude — see **Performance** under **Threat Intelligence Graph** |
+
+These numbers describe **this local dataset and this local model**, not general-purpose DDoS
+detection performance — see "Why 99.99% accuracy is not a general DDoS-detection claim" below.
+
 **Held-out test vs. full-dataset metrics.** `backend/ml/train.py` does not persist the original
 train/test row indices, but it does persist a fixed `random_state`/`test_size`, and
 `train_test_split()` is deterministic given the same input rows in the same order. Re-running the
@@ -1992,38 +2091,90 @@ docker-compose.yml               # wires the backend + frontend images together 
 .env.example                     # placeholder values for docker-compose.yml (copy to .env, gitignored)
 ```
 
-## Known Limitations
+## Final Limitations Summary
 
-- `severity` is a qualitative LLM judgment, not sourced from the knowledge base — the five
-  documents contain no severity ratings.
+One definitive limitations list, organized by area. Items with a section reference already have
+their full detail and reasoning written there — this list doesn't duplicate that, only indexes it.
+Nothing here is described as a "future feature" unless it genuinely is planned work rather than a
+structural boundary of this project's current scope.
+
+### ML & dataset
+
+- **Binary dataset only** — the local CICIDS2017 capture contains exactly `BENIGN`/`DDoS`, a single
+  Friday-afternoon capture file, not a multi-day or multi-scenario collection. Accuracy figures
+  describe separability of *this* binary problem on *this* capture, not general attack detection —
+  see **Evaluation & Benchmarking** > "Why 99.99% accuracy is not a general DDoS-detection claim."
+- **No external validation dataset** — all evaluation (held-out and full-dataset) is against splits
+  of this same single source file; there is no independent second dataset any number here has been
+  cross-checked against.
+- **High class separability** — this specific binary problem is easy for a Random Forest to learn
+  well; the near-perfect metrics are a property of the data, not evidence the architecture would
+  perform as well on a harder, more balanced, multi-class problem — see **Evaluation &
+  Benchmarking**'s calibration discussion (near-zero Brier score, predictions concentrated at the
+  extremes).
+- Classifier is binary (BENIGN/DDoS) and single-threat, same as the original notebook. The
+  surrounding schema/metrics/mapping architecture is multi-class-*ready* (Phase 10), but no
+  additional class is trained — see **Multi-class-ready architecture (Phase 10)**.
+- `severity` is a qualitative LLM judgment, not sourced from the knowledge base — the five documents
+  contain no severity ratings.
 - The LLM occasionally misclassifies which list a grounded fact belongs in (e.g. putting
   mitigation-style text under `indicators` instead of `mitigations`) even though the underlying
-  content is always genuinely from the retrieved context. This is a field-mapping quality issue
-  with the small local model, not a hallucination/grounding issue.
-- Each query reports a single primary threat type; a query that's genuinely about two threats at
-  once will only be analyzed with respect to the better-matching one.
-- The MITRE ATT&CK coverage is limited to what's written in the five current `.txt` files (one
-  or two techniques per file) — it is not a general ATT&CK reference.
+  content is always genuinely from the retrieved context — a field-mapping quality issue with the
+  small local model, not a hallucination/grounding issue.
+- Each query reports a single primary threat type; a query genuinely about two threats at once is
+  only analyzed with respect to the better-matching one.
+- MITRE ATT&CK coverage is limited to what's written in the five current `.txt` files — not a
+  general ATT&CK reference.
 - The relevance threshold (`RAG_SCORE_THRESHOLD=1.5`) was tuned against this specific 14-chunk
   knowledge base; it should be re-validated if the corpus grows.
-- Rate limiting (Phase 8) is per-process, in-memory, and IP-keyed — see **Observability &
-  Operations** > "Rate Limiting" for exactly what that does and doesn't cover. There is no live
-  threat feed integration.
+- **Graph is deterministic and one-hop** — every relationship returned is a direct edge from the
+  queried threat entity; there is no multi-hop traversal or transitive relationship discovery — see
+  **Threat Intelligence Graph** > "Known limitations."
+- **Retrieval benchmark is a sanity check, not a formal IR benchmark** — six queries (five real
+  topics + one negative control), no independent relevance-judgment set — see **Evaluation &
+  Benchmarking** > "Retrieval evaluation is coverage, not accuracy."
+- **No trained classifier model is committed to the repository** (`models/` is gitignored) —
+  `/classify` and `/analyze/classification` return `503` on a fresh checkout until someone runs
+  `uv run python -m backend.ml.train` against a real CICIDS2017 CSV (see "Getting the dataset"). A
+  real model *has* since been trained locally in this development environment — see
+  **Multi-class-ready architecture (Phase 10)** for its real metrics table — this bullet is about
+  what ships in git, not whether the pipeline has been exercised against real data.
+- The Random Forest classifier only maps to one RAG query (DDoS → "How can DDoS attacks be
+  mitigated?") — the same query already proven to retrieve well in **Relevance Filtering**.
+
+### Security, scaling & operations
+
+- **In-memory sessions and rate limiter** — both are single-process by design; a multi-replica
+  deployment would need sticky sessions or a shared store first — see **Production Deployment
+  Architecture** > "Scaling Analysis."
+- **No frontend automated browser test suite** — login/logout/protected-route flows were verified
+  manually against the real backend, not by an automated test runner — see **Testing**.
+
+### Deployment & infrastructure
+
+- **No TLS is actually deployed** — the reverse-proxy config is an example file, no real certificate
+  was obtained or referenced — see **TLS / Ingress**.
+- **Ollama is an external dependency** not managed by this repository, whether running on the same
+  host or a dedicated GPU host — see **Production Deployment Architecture** > "Where does the LLM
+  run?"
+- **GPU infrastructure is a documented recommendation, not a deployed resource** — no GPU host was
+  provisioned, tested, or measured against.
+- **Backend Docker image is large** (multi-GB) because of the existing ML dependency stack
+  (`torch`/`sentence-transformers`'s transitive CUDA wheels, pulled even though inference itself is
+  CPU-only) — see **Docker Backend** > "Image sizes."
+- **Embedding model cold-start/cache** — a fresh `hf_cache` volume means the first request after
+  container creation needs network access to huggingface.co (~80MB download) — see **Production
+  Deployment Architecture** > "Persistence & State."
+- **No real cloud deployment, no multi-region, no distributed scaling** — the recommended
+  architecture (single VM/VPS + reverse proxy) was designed and partially validated locally
+  (Compose config, frontend container hardening), never deployed to a real cloud account — see
+  **Production Deployment Architecture** in full, especially "Current Limitations" and "What remains
+  cloud-provider-specific."
+
+### Frontend verification scope
+
 - The frontend was verified visually at desktop width (~1440px) and functionally end-to-end
   against the real backend + Ollama. Narrower breakpoints (tablet/mobile) are implemented with
   standard Tailwind responsive classes (sidebar collapses to a top bar below `lg`, card grids
   reflow via `sm`/`xl` columns) but were not independently confirmed by resizing a real browser
   viewport in this environment.
-- **No trained classifier model is committed to the repository** (`models/` is gitignored, same as
-  every other build artifact in this project) — `/classify` and `/analyze/classification` return
-  `503` on a fresh checkout until someone runs `uv run python -m backend.ml.train` against a real
-  CICIDS2017 CSV (see "Getting the dataset" above). A real model *has* since been trained locally
-  in this development environment against the real 225,745-row dataset — see the real metrics
-  table in **Multi-class-ready architecture (Phase 10)** above — this bullet is about what ships
-  in git, not about whether the pipeline has ever been exercised against real data.
-- The classifier is binary (BENIGN/DDoS only) and single-threat, same as the original notebook —
-  it does not detect other attack types. The surrounding schema/metrics/mapping architecture is
-  multi-class-*ready* (Phase 10), but no additional class is trained; see that section for exactly
-  what would be needed to add one honestly.
-- The Random Forest classifier only maps to one RAG query (DDoS → "How can DDoS attacks be
-  mitigated?"); this is the same query already proven to retrieve well in **Relevance Filtering**.
