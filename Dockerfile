@@ -18,9 +18,16 @@ FROM python:3.12-slim AS builder
 # just a build tool, so this stage never appears in the final image.
 COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /uvx /bin/
 
+# UV_HTTP_TIMEOUT: uv's default (~30s) is too short for the several-hundred-MB
+# NVIDIA/CUDA wheels pulled in transitively via torch <- sentence-transformers on a
+# slower connection, causing `uv sync` below to fail with a download timeout even
+# though the locked dependency set itself is unchanged. This only raises how long uv
+# waits per HTTP operation during this build step -- it does not change what gets
+# installed, add/remove any dependency, or affect the running application.
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    UV_PYTHON_DOWNLOADS=never
+    UV_PYTHON_DOWNLOADS=never \
+    UV_HTTP_TIMEOUT=300
 
 WORKDIR /app
 

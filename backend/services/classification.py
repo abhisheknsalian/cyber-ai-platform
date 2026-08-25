@@ -45,7 +45,10 @@ def classify_and_analyze(
         prediction=request.prediction,
         probability=request.probability,
         model="random_forest",
-        classification="malicious" if request.prediction == "DDoS" else "benign",
+        # Generalizes beyond a DDoS-specific check, matching backend/ml/predictor.py's
+        # predict(): any non-BENIGN prediction is "malicious". Behaviorally identical
+        # to the old `== "DDoS"` check given the two labels LABEL_MAP currently has.
+        classification="malicious" if request.prediction != "BENIGN" else "benign",
     )
 
     if request.prediction == "BENIGN":

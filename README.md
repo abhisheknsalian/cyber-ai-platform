@@ -265,7 +265,7 @@ CICIDS2017 CSV (Friday-Afternoon-DDoS capture)
 At inference:
 NetworkTrafficFeatures (validated Pydantic request)
    → backend/ml/predictor.py: load saved model, predict + predict_proba
-   → ClassificationResult (prediction, probability, model)
+   → ClassificationResult (prediction, probability, classification, class_probabilities, model_version)
    → optionally: backend/services/classification.py maps DDoS → the same RAG query used by
      the Threat Analysis page → ThreatAnalysis (identical shape to /analyze's response)
 ```
@@ -317,10 +317,25 @@ cleaned dataset before the split (and log how many rows were removed), and strat
 The model architecture and hyperparameters are unchanged (`RandomForestClassifier(n_estimators=100,
 random_state=42)`), per Phase 4 scope -- only the leakage is fixed, not the model.
 
-**Honest metrics from this fix have not been produced yet.** The real 225k-row dataset was not
-available in this environment (see below), so real retraining hasn't run. Do not treat any
-number printed by a training run against a placeholder/synthetic dataset as a real evaluation
-result -- see **Known Limitations**.
+**Real metrics, from the real 225,745-row dataset, after the leakage fix above:**
+
+| Metric | Value |
+|---|---|
+| Accuracy | 99.99% |
+| Macro F1 | 99.99% |
+| DDoS precision / recall | 99.996% / 99.988% |
+| Train / test rows | 178,465 / 44,617 (stratified 80/20, post-cleaning) |
+| Confusion matrix (BENIGN, DDoS) | `[[19013, 1], [3, 25600]]` |
+
+Read this honestly, not as "DDoS is a solved problem": the leakage audit above ruled out
+duplicate-row and label leakage (confirmed again in the Phase 10 audit below), and the top feature
+importances are spread across legitimate flow-shape features rather than one dominant shortcut
+(`Destination Port` ranks 10th at ~3.9%) — but this is still *one* attack tool against *one* target
+in a *single, short capture window*. The classes are unusually separable by construction. This
+result means "the model correctly learned to separate this specific DDoS tool's traffic pattern
+from this specific benign traffic sample," not "any DDoS attack is trivially detectable in
+general." Re-run `uv run python -m backend.ml.train` to reproduce these numbers yourself (see the
+generated `models/ddos_random_forest.metadata.json` for the full classification report).
 
 ### Feature schema and validation
 
@@ -336,6 +351,54 @@ model.
 
 `GET /ml/feature-importance` returns the trained model's own `feature_importances_`, ranked --
 nothing is invented or hand-labeled.
+
+### Multi-class-ready architecture (Phase 10)
+
+**The trained model remains a genuine binary classifier: BENIGN or DDoS, nothing else.** The only
+local training data is the one CICIDS2017 file above, which contains exactly these two labels (see
+the Phase 10 dataset audit below) — no other attack class has been trained, and none is claimed.
+
+What changed is the *architecture* around that model, so a real additional class can be added later
+by editing configuration and retraining, not by hunting down scattered hardcoded values:
+
+- **`backend/ml/config.py`'s `LABEL_MAP`** (`{"BENIGN": 0, "DDoS": 1}`, unchanged) is now the
+  single source of truth every downstream component derives from, instead of each maintaining its
+  own separate BENIGN/DDoS list.
+- **`ClassificationResult.prediction` and `ClassificationAnalysisRequest.prediction`** are `str`,
+  validated at runtime against `LABEL_MAP` (`backend/ml/schemas.py`) instead of a hardcoded
+  `Literal["BENIGN", "DDoS"]`. This is not "accept any string" — a prediction outside the
+  currently configured labels is still rejected (`422`), exactly as before; it's just checked
+  against the one real source of truth instead of a second hardcoded copy of it.
+- **`class_probabilities: dict[str, float] | None`** (additive) -- the complete `predict_proba()`
+  vector keyed by class label (e.g. `{"BENIGN": 0.02, "DDoS": 0.98}`), not just the winning class's
+  probability. Built in `backend/ml/predictor.py` from `model.classes_` (sklearn's own record of
+  which label each `predict_proba()` column corresponds to) rather than assumed column positions,
+  so it stays correct however many classes a future model has.
+- **`model_version: str | None`** (additive) -- which trained artifact produced this prediction,
+  sourced from `models/ddos_random_forest.metadata.json`'s own `trained_at` timestamp (the
+  existing metadata format already has this field; no new "version" concept was invented). `None`
+  if no metadata file is present alongside the model.
+- **`backend/ml/train.py`'s metrics** (`compute_classification_metrics`) are now class-count-
+  agnostic -- per-class precision/recall/F1, macro and weighted F1, and a confusion matrix sized
+  and labeled from however many classes `LABEL_MAP` actually has, plus dataset-quality statistics
+  (duplicate/missing/infinite-value counts, computed before cleaning) written into the training
+  metadata. This already benefits the current binary model (see the real metrics table above); it
+  isn't dormant multi-class code.
+- **`backend/services/classification.py`'s `PREDICTION_TO_QUERY`/`PREDICTION_TO_THREAT_STEM`**
+  mappings are unchanged in structure and still only contain `"DDoS"` -- no `PortScan`/`Bot`/
+  `Infiltration`/etc. entries were added, because no such trained class exists. If a prediction
+  ever reached this service without a corresponding mapping, `UnsupportedPredictionError` is
+  raised explicitly (`tests/test_ml_dynamic_labels.py`) rather than silently producing an
+  incorrect threat analysis.
+- **`backend/intelligence/*` (the threat graph) is unmodified.** It was already label-driven
+  through `PREDICTION_TO_THREAT_STEM`; nothing about Phase 10 required touching it.
+
+**Not currently claimed, because no such class is trained:** PortScan detection, Bot detection,
+Infiltration detection, Web Attack detection, DoS Hulk detection, or any other CICIDS2017 attack
+category. Obtaining additional real CICIDS2017 day-files (e.g. Tuesday for PortScan/Brute Force,
+Wednesday for DoS variants, Thursday for Web Attack/Infiltration) and placing them in `data/raw/`
+would let a real class be added through this same architecture -- `LABEL_MAP` plus a retrain --
+without further schema surgery. No such file is fabricated or auto-downloaded by this project.
 
 ### Classifier + RAG integration
 
@@ -1393,14 +1456,16 @@ docker-compose.yml               # wires the backend + frontend images together 
   standard Tailwind responsive classes (sidebar collapses to a top bar below `lg`, card grids
   reflow via `sm`/`xl` columns) but were not independently confirmed by resizing a real browser
   viewport in this environment.
-- **No real trained classifier model is included or committed.** The actual CICIDS2017 dataset
-  was never available in the development environment this project was built in (see "Getting the
-  dataset" above) — `/classify` and `/analyze/classification` will return `503` until someone
-  runs `uv run python -m backend.ml.train` against the real CSV. The pipeline, leakage fix, API,
-  RAG integration, and frontend page were all built and verified against a small synthetic
-  fixture (see **Testing**) and a temporary demo dataset used only to visually confirm the UI
-  flow — neither represents real-world accuracy, and both were deleted afterward.
+- **No trained classifier model is committed to the repository** (`models/` is gitignored, same as
+  every other build artifact in this project) — `/classify` and `/analyze/classification` return
+  `503` on a fresh checkout until someone runs `uv run python -m backend.ml.train` against a real
+  CICIDS2017 CSV (see "Getting the dataset" above). A real model *has* since been trained locally
+  in this development environment against the real 225,745-row dataset — see the real metrics
+  table in **Multi-class-ready architecture (Phase 10)** above — this bullet is about what ships
+  in git, not about whether the pipeline has ever been exercised against real data.
 - The classifier is binary (BENIGN/DDoS only) and single-threat, same as the original notebook —
-  it does not detect other attack types.
+  it does not detect other attack types. The surrounding schema/metrics/mapping architecture is
+  multi-class-*ready* (Phase 10), but no additional class is trained; see that section for exactly
+  what would be needed to add one honestly.
 - The Random Forest classifier only maps to one RAG query (DDoS → "How can DDoS attacks be
   mitigated?"); this is the same query already proven to retrieve well in **Relevance Filtering**.

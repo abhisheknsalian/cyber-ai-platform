@@ -26,6 +26,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 
 from backend.ml.config import (
+    INVERSE_LABEL_MAP,
     METADATA_PATH,
     MODEL_DIR,
     MODEL_PATH,
@@ -35,7 +36,49 @@ from backend.ml.config import (
     TARGET_COLUMN,
     TEST_SIZE,
 )
-from backend.ml.preprocessing import load_and_clean_dataset, split_features_target
+from backend.ml.preprocessing import compute_dataset_quality_stats, load_and_clean_dataset, split_features_target
+
+
+def compute_classification_metrics(y_test, y_pred) -> dict:
+    """Class-count-agnostic evaluation (Phase 10): works whether the model was
+    trained on 2 classes (today's real BENIGN/DDoS data) or more (whenever real
+    multi-class data is available -- see README "ML Detection Pipeline"). Class
+    ordering/names are derived from INVERSE_LABEL_MAP (backend/ml/config.py), the
+    same single source of truth used everywhere else, rather than a hardcoded
+    ["BENIGN", "DDoS"] list.
+    """
+    class_indices = sorted(INVERSE_LABEL_MAP)
+    class_names = [INVERSE_LABEL_MAP[index] for index in class_indices]
+
+    report_text = classification_report(
+        y_test, y_pred, labels=class_indices, target_names=class_names, zero_division=0
+    )
+    matrix = confusion_matrix(y_test, y_pred, labels=class_indices).tolist()
+
+    per_class_precision = precision_score(y_test, y_pred, labels=class_indices, average=None, zero_division=0)
+    per_class_recall = recall_score(y_test, y_pred, labels=class_indices, average=None, zero_division=0)
+    per_class_f1 = f1_score(y_test, y_pred, labels=class_indices, average=None, zero_division=0)
+
+    per_class = {
+        class_names[i]: {
+            "precision": float(per_class_precision[i]),
+            "recall": float(per_class_recall[i]),
+            "f1": float(per_class_f1[i]),
+        }
+        for i in range(len(class_names))
+    }
+
+    metrics = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "precision_macro": precision_score(y_test, y_pred, labels=class_indices, average="macro", zero_division=0),
+        "recall_macro": recall_score(y_test, y_pred, labels=class_indices, average="macro", zero_division=0),
+        "f1_macro": f1_score(y_test, y_pred, labels=class_indices, average="macro", zero_division=0),
+        "f1_weighted": f1_score(y_test, y_pred, labels=class_indices, average="weighted", zero_division=0),
+        "per_class": per_class,
+        "confusion_matrix": matrix,
+        "confusion_matrix_labels": class_names,
+    }
+    return metrics, report_text
 
 
 def train(data_path=RAW_DATA_PATH, model_path=MODEL_PATH, metadata_path=METADATA_PATH):
@@ -46,10 +89,21 @@ def train(data_path=RAW_DATA_PATH, model_path=MODEL_PATH, metadata_path=METADATA
             "DDOS_DATASET_PATH to point at it."
         )
 
+    quality_stats = compute_dataset_quality_stats(data_path)
+    print(
+        f"Raw dataset quality: {quality_stats['total_rows_before_cleaning']} rows, "
+        f"{quality_stats['duplicate_rows']} duplicate ({quality_stats['duplicate_rate']:.2%}), "
+        f"{quality_stats['missing_value_total']} missing value(s), "
+        f"{quality_stats['infinite_value_total']} infinite value(s)"
+    )
+
     df = load_and_clean_dataset(data_path)
 
-    class_distribution = df[TARGET_COLUMN].value_counts().to_dict()
-    print(f"Class distribution after cleaning (0=BENIGN, 1=DDoS): {class_distribution}")
+    class_distribution = {
+        INVERSE_LABEL_MAP.get(label, str(label)): count
+        for label, count in df[TARGET_COLUMN].value_counts().to_dict().items()
+    }
+    print(f"Class distribution after cleaning: {class_distribution}")
 
     X, y = split_features_target(df)
 
@@ -63,27 +117,13 @@ def train(data_path=RAW_DATA_PATH, model_path=MODEL_PATH, metadata_path=METADATA
 
     y_pred = model.predict(X_test)
 
-    report_text = classification_report(y_test, y_pred, target_names=["BENIGN", "DDoS"])
-    matrix = confusion_matrix(y_test, y_pred).tolist()
-
-    metrics = {
-        "accuracy": accuracy_score(y_test, y_pred),
-        "precision_macro": precision_score(y_test, y_pred, average="macro"),
-        "recall_macro": recall_score(y_test, y_pred, average="macro"),
-        "f1_macro": f1_score(y_test, y_pred, average="macro"),
-        # DDoS is label 1 -- report it specifically since recall on the attack
-        # class matters more than overall accuracy for a detection system.
-        "ddos_precision": precision_score(y_test, y_pred, pos_label=1),
-        "ddos_recall": recall_score(y_test, y_pred, pos_label=1),
-        "ddos_f1": f1_score(y_test, y_pred, pos_label=1),
-        "confusion_matrix": matrix,
-        "class_distribution": class_distribution,
-        "train_rows": len(X_train),
-        "test_rows": len(X_test),
-    }
+    metrics, report_text = compute_classification_metrics(y_test, y_pred)
+    metrics["class_distribution"] = class_distribution
+    metrics["train_rows"] = len(X_train)
+    metrics["test_rows"] = len(X_test)
 
     print("\nClassification report:\n" + report_text)
-    print(f"Confusion matrix [[TN, FP], [FN, TP]]: {matrix}")
+    print(f"Confusion matrix {metrics['confusion_matrix_labels']}: {metrics['confusion_matrix']}")
 
     model_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, model_path)
@@ -94,6 +134,12 @@ def train(data_path=RAW_DATA_PATH, model_path=MODEL_PATH, metadata_path=METADATA
         "random_state": RANDOM_STATE,
         "test_size": TEST_SIZE,
         "feature_count": len(X.columns),
+        # The classes this specific artifact was actually trained on, sorted by
+        # label index -- explicit and inspectable, rather than implied only by
+        # LABEL_MAP (which describes *configured* labels, not necessarily what any
+        # one past training run used, if LABEL_MAP is ever extended later).
+        "class_labels": metrics["confusion_matrix_labels"],
+        "dataset_quality": quality_stats,
         "metrics": metrics,
         "classification_report": report_text,
     }
