@@ -30,20 +30,19 @@ export function ThreatIntelligencePage() {
   return (
     <div>
       <PageHeader
+        eyebrow="Local Knowledge Base"
         title="Threat Intelligence"
-        description="The threat categories currently available in the local knowledge base (data/threat_intel/)."
+        description="Threat categories loaded from data/threat_intel/, each with its direct relationships (techniques, indicators, mitigations, sources) in the threat graph."
       />
 
       {error && (
-        <Card className="mb-6 border-severity-critical/30 bg-severity-critical/5 px-4 py-3 text-sm text-severity-critical">
-          {error}
-        </Card>
+        <Card className="mb-6 border-malicious/30 bg-malicious/5 px-4 py-3 text-sm text-malicious-strong">{error}</Card>
       )}
 
       {loading ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {Array.from({ length: 5 }).map((_, i) => (
-            <div key={i} className="h-32 animate-pulse rounded-lg border border-border bg-surface-raised" />
+            <div key={i} className="h-40 animate-pulse rounded-md border border-border bg-surface-raised" />
           ))}
         </div>
       ) : (
@@ -52,23 +51,34 @@ export function ThreatIntelligencePage() {
             const Icon = ICONS[threat.threat_type] ?? ShieldAlert;
             const isExpanded = expanded === threat.threat_type;
             return (
-              <Card key={threat.threat_type} className="p-5">
+              <Card key={threat.threat_type} className={isExpanded ? "p-5 xl:col-span-3" : "p-5"}>
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex items-center gap-2.5">
                     <Icon className="h-5 w-5 text-accent" strokeWidth={1.75} />
-                    <h2 className="text-sm font-semibold text-text">{formatThreatType(threat.threat_type)}</h2>
+                    <div>
+                      <p className="font-mono text-[10px] uppercase tracking-wider text-text-faint">Threat Type</p>
+                      <h2 className="text-sm font-semibold text-text">{formatThreatType(threat.threat_type)}</h2>
+                    </div>
                   </div>
-                  <StatusPill ok onLabel="In knowledge base" offLabel="Missing" />
+                  <StatusPill ok onLabel="In KB" offLabel="Missing" />
                 </div>
-                <p className="mt-3 text-sm leading-relaxed text-text-muted">{threat.description}</p>
-                <p className="mt-3 font-mono text-xs text-text-faint">{threat.source}</p>
+
+                <p className="mt-3 text-[11px] font-medium uppercase tracking-wide text-text-faint">Description</p>
+                <p className="mt-1 text-sm leading-relaxed text-text-muted">{threat.description}</p>
+
+                <p className="mt-3 text-[11px] font-medium uppercase tracking-wide text-text-faint">Source</p>
+                <p className="mt-1 font-mono text-xs text-text">{threat.source}</p>
 
                 <button
                   type="button"
                   onClick={() => setExpanded(isExpanded ? null : threat.threat_type)}
+                  aria-expanded={isExpanded}
                   className="mt-4 flex w-full items-center justify-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-text-muted transition-colors hover:border-border-strong hover:bg-surface-hover hover:text-text"
                 >
-                  <ChevronDown className={`h-3.5 w-3.5 transition-transform ${isExpanded ? "rotate-180" : ""}`} strokeWidth={1.75} />
+                  <ChevronDown
+                    className={`h-3.5 w-3.5 transition-transform ${isExpanded ? "rotate-180" : ""}`}
+                    strokeWidth={1.75}
+                  />
                   {isExpanded ? "Hide relationship graph" : "View relationship graph"}
                 </button>
 

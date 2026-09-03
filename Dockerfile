@@ -66,6 +66,12 @@ COPY --from=builder /app/.venv /app/.venv
 COPY backend/ backend/
 COPY data/threat_intel/ data/threat_intel/
 
+# Alembic migrations (Phase 13's users table) -- applied by CMD below before uvicorn
+# starts, against whatever DATABASE_URL points at (docker-compose.yml's dedicated
+# `db` Postgres service by default). See README "Database Architecture".
+COPY alembic.ini ./
+COPY alembic/ alembic/
+
 # Mount points for the gitignored runtime artifacts this image never contains: the
 # trained classifier (models/), the Chroma vector store (rag/chroma_db/), and the
 # sentence-transformers embedding model cache (HF_HOME above -- otherwise implicitly
@@ -91,6 +97,9 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"
 
-# Production server: no --reload, binds all interfaces so the container's port
-# mapping works.
-CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Applies pending Alembic migrations before every start (idempotent -- a no-op once
+# the schema is current), then runs the production server: no --reload, binds all
+# interfaces so the container's port mapping works. Requires DATABASE_URL's target to
+# already be reachable -- docker-compose.yml/.prod.yml enforce that with
+# `depends_on: db: condition: service_healthy`.
+CMD ["sh", "-c", "alembic upgrade head && python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000"]

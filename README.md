@@ -66,7 +66,7 @@ caveat in detail.
 | Threat intelligence graph | Deterministic, one-hop entity/relationship graph built from the same source documents — no LLM involved in graph construction (see **Threat Intelligence Graph**) |
 | Hybrid retrieval | Combines vector and graph evidence into one typed, evidence-first LLM context (see **Threat Intelligence Graph** > "Hybrid retrieval") |
 | Evidence integrity | The LLM's own output schema has no field for prediction/probability/MITRE ID/source — structurally, not just by prompt instruction, it cannot override them (see **Classifier integration**) |
-| Authentication | API-key + browser session (HttpOnly cookie + CSRF double-submit), both fail closed (see **Authentication**) |
+| Authentication | API-key + browser session (HttpOnly cookie + CSRF double-submit) with persistent, multi-user accounts (argon2id-hashed passwords, SQLAlchemy + Alembic) behind registration/login, both fail closed (see **Authentication**, **Database Architecture**) |
 | Operational hardening | Rate limiting, request IDs, structured JSON logging, security headers, health/readiness separation (see **Observability & Operations**) |
 | Evaluation | Reproducible held-out/full-dataset metrics, threshold and calibration analysis, retrieval coverage benchmark, per-stage pipeline latency (see **Evaluation & Benchmarking**) |
 | Deployment architecture | Hardened Docker images, a production Compose profile, and a documented (not deployed) single-VM + reverse-proxy architecture (see **Production Deployment Architecture**) |
@@ -267,6 +267,7 @@ accumulates stale or duplicate chunks.
 - `GET /intelligence/graph/{threat_id}` — one threat's direct graph relationships (Phase 9) (public)
 - `POST /intelligence/search` — hybrid (vector + graph) search (Phase 9; protected, rate-limited)
 - `GET /docs` — interactive Swagger UI (public)
+- `POST /auth/register` — create a new persistent user account (Phase 13; see **Authentication** and **Database Architecture** below) (public, rate-limited)
 - `POST /auth/login`, `POST /auth/logout`, `GET /auth/me` — see **Authentication** below (login is rate-limited; all three are public — session/API-key auth is what they exist to provide, not what protects them)
 
 `GET /health` response (unchanged since Phase 6):
@@ -833,10 +834,15 @@ hand-built with Tailwind.
 - **Threat Intelligence** (`/intelligence`) — the threat categories from `GET /threats`, i.e.
   exactly what's in `data/threat_intel/`.
 - **About** (`/about`) — architecture explanation; states plainly what is and isn't implemented.
-- **Login** — shown instead of the app for an unauthenticated session (see **Authentication**).
-  `AuthProvider`/`useAuth` (`frontend/src/context/AuthContext.tsx`) call `GET /auth/me` on startup,
-  gate all five pages above behind `authenticated`, and drop back to the login page automatically
-  if any request ever comes back `401`. The sidebar's "Log out" button calls `POST /auth/logout`.
+- **Login** (`/login`, and the default for any unmatched path while unauthenticated) — shown
+  instead of the app for an unauthenticated session (see **Authentication**). `AuthProvider`/
+  `useAuth` (`frontend/src/context/AuthContext.tsx`) call `GET /auth/me` on startup, gate all five
+  pages above behind `authenticated`, and drop back to the login page automatically if any request
+  ever comes back `401`. The sidebar's "Log out" button calls `POST /auth/logout`.
+- **Register** (`/register`, Phase 13) — username/password form (loading, error, and success
+  states) that calls `POST /auth/register`; on success, redirects to `/login` after a brief
+  confirmation rather than logging the user in automatically, matching the registration flow in
+  **Authentication**. Linked from the Login page ("Create one") and back again ("Sign in").
 
 **API integration**: `frontend/src/services/api.ts` is the only place that calls `fetch`;
 `analyzeThreat`/`getHealth`/`getThreats`/`classifyTraffic`/`getFeatureImportance`/`analyzeClassification`
@@ -870,8 +876,10 @@ All settings have sane local defaults and can be overridden with environment var
 | `DDOS_DATASET_PATH` | `data/raw/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv` | CICIDS2017 CSV used by `backend.ml.train` |
 | `ML_MODEL_DIR` | `models` | Where the trained classifier artifact + metadata are saved/loaded |
 | `CYBER_AI_API_KEY` | *(unset)* | API key for direct API clients — see **Authentication** below. No default |
-| `CYBER_AI_USERNAME` | *(unset)* | Browser login username — see **Authentication** below. No default |
-| `CYBER_AI_PASSWORD` | *(unset)* | Browser login password — see **Authentication** below. No default |
+| `CYBER_AI_USERNAME` | *(unset)* | Demo/bootstrap browser login username — see **Authentication** below. No default |
+| `CYBER_AI_PASSWORD` | *(unset)* | Demo/bootstrap browser login password — see **Authentication** below. No default |
+| `DATABASE_URL` | `sqlite:///./data/cyber_ai.db` | Where persistent user accounts live — see **Database Architecture** below |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `cyber_ai` / *(required in Docker)* / `cyber_ai` | Credentials for the Docker Compose `db` service; combined into `DATABASE_URL`'s default when running via Compose |
 | `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed browser origins — see **Docker Compose** > "CORS reconfiguration" |
 | `RATE_LIMIT_LOGIN_MAX` | `5` | Max `POST /auth/login` attempts per IP per window — see **Observability & Operations** > "Rate Limiting" |
 | `RATE_LIMIT_LOGIN_WINDOW_SECONDS` | `60` | Window for the login limit above |
@@ -891,11 +899,92 @@ starts and logs a warning, so public endpoints keep working while secrets are st
 provisioned; every protected endpoint independently fails closed to `401` until they're set. No
 startup log ever prints a secret's actual value, only whether it's configured.
 
+## Database Architecture
+
+Phase 13 adds the first relational store this project has ever needed: persistent, multi-user
+accounts. Before this phase, every credential path was either a hardcoded environment variable
+(the demo `CYBER_AI_USERNAME`/`PASSWORD`) or an in-memory session dict — nothing survived a
+restart, and there was exactly one "user."
+
+```text
+User
+ ↓
+Registration / Login
+ ↓
+FastAPI (backend/services/users.py, backend/services/auth.py)
+ ↓
+SQLAlchemy 2.x (backend/db/) ──→ Postgres (Docker) or SQLite (local/test)
+```
+
+**Stack:** SQLAlchemy 2.x (`backend/db/base.py`, `backend/db/models.py`, `backend/db/session.py`)
++ Alembic migrations (`alembic/`, `alembic.ini`) — schema changes go through a checked-in
+migration, never `Base.metadata.create_all()` at application startup, so the schema history is
+explicit and reviewable the same way any other code change is. The one exception is the test
+suite (`tests/conftest.py`), which creates the schema directly from the ORM models against an
+isolated temp SQLite file — the standard shortcut for tests, matching how `CHROMA_PERSIST_DIR`
+and `DDOS_DATASET_PATH` are already isolated per test run there.
+
+**Engine choice, by environment:**
+
+| Environment | `DATABASE_URL` | Why |
+|---|---|---|
+| `docker compose up -d` | `postgresql+psycopg://...@db:5432/...` (derived automatically from `POSTGRES_*` in `.env`) | A dedicated, isolated `db` service (see **Docker Compose** below) — never the host's own Postgres, if one happens to be running for an unrelated project |
+| Non-Docker local dev (`uv run uvicorn ...`) | `sqlite:///./data/cyber_ai.db` (default, no setup) | Keeps the existing zero-infrastructure local-dev workflow intact — no database to install or run just to try the app |
+| `uv run pytest` | An isolated temp SQLite file, set in `tests/conftest.py` before any `backend.*` import | Never touches a real database; reset between tests (see `_reset_users_table`) |
+
+Only one table exists today:
+
+```text
+users
+  id            INTEGER PRIMARY KEY
+  username      VARCHAR(64) UNIQUE NOT NULL
+  password_hash VARCHAR(255) NOT NULL   -- argon2id, never plaintext
+  is_active     BOOLEAN NOT NULL DEFAULT true
+  created_at    TIMESTAMPTZ NOT NULL
+  updated_at    TIMESTAMPTZ NOT NULL
+```
+
+**Applying migrations:**
+
+```bash
+# Local dev (SQLite, no Docker):
+uv run alembic upgrade head
+
+# Docker: applied automatically, every container start (Dockerfile's CMD runs
+# `alembic upgrade head` before uvicorn — idempotent, a no-op once the schema is current)
+```
+
+### User-specific investigations (foundation, not yet built)
+
+The Network Detection page's investigation state
+(`frontend/src/store/networkDetectionStore.ts`, persisted client-side under the
+`cyber-ai-network-detection-v1` `localStorage` key) is **unchanged by this phase** — it still
+works exactly as before, for both anonymous and now-authenticated users. Phase 13 only builds the
+identity foundation a future phase would need to make that state per-user and server-persisted:
+
+```text
+users
+  ↓ (1-to-many, FK user_id)
+investigations            -- one row per Network Detection session: created_at, label
+  ↓ (1-to-many, FK investigation_id)
+classification_results    -- one row per POST /classify call: features (jsonb), prediction, confidence
+  ↓ (1-to-one, FK classification_result_id)
+analysis_results           -- the POST /analyze/classification output for that result, if run
+```
+
+That schema is deliberately **not implemented yet** — this phase's job was the user/database
+foundation, not moving `localStorage` state to the server (a genuinely separate, larger change:
+new endpoints, a migration, and a frontend rewrite of `networkDetectionStore.ts` from a local
+Zustand-persisted store to server-fetched state). Building it later is a clean, additive Alembic
+migration on top of the `users` table already in place, with each new table's `user_id` resolved
+from the authenticated session (`backend/sessions.py::session_identity()`) the same way
+`require_auth()` already does for every protected endpoint.
+
 ## Authentication
 
 See **Backend Endpoints** above for exactly which endpoints require authentication and which are
-public — this section covers *how* the two credential paths work, not which endpoints use them.
-There are two independent credential paths, either of which satisfies a protected request:
+public — this section covers *how* credentials work, not which endpoints use them. There are two
+independent credential paths, either of which satisfies a protected request:
 
 ```text
 Direct API client:  Authorization: Bearer <CYBER_AI_API_KEY>  ─┐
@@ -919,18 +1008,34 @@ path is always rejected with `401` — there is no default key. The key is compa
 constant-time comparison (`hmac.compare_digest`) and is never logged, echoed in a response, or
 included in the OpenAPI schema.
 
-### Browser (the React frontend)
+### Browser (the React frontend): registration and login
 
 **The frontend never receives or sends `CYBER_AI_API_KEY`.** It's a static, client-side-only SPA
 with no backend-for-frontend proxy, so there is nowhere to hold that secret a browser couldn't
-also read out of the shipped JS bundle. Instead, the frontend uses a server-side session:
+also read out of the shipped JS bundle. Instead, the frontend uses a server-side session, now
+backed by real persistent accounts (Phase 13):
 
 ```text
+POST /auth/register {username, password}
+   → backend/services/users.py validates the input, hashes the password with
+     argon2-cffi (Argon2id, OWASP's current recommendation) and persists the
+     user — returns id/username/created_at only, never the password or its hash
+
 POST /auth/login {username, password}
-   → backend/services/auth.py validates against CYBER_AI_USERNAME / CYBER_AI_PASSWORD
-     (hmac.compare_digest, both fields always compared so timing can't reveal which was wrong)
-   → backend/sessions.py creates an in-memory session: a cryptographically random
-     token (secrets.token_urlsafe(32)), no user data or secrets encoded in it
+   → backend/services/auth.py tries, in order:
+       1. a registered user (backend/services/users.py::authenticate() — argon2
+          verify against the stored hash; a nonexistent username still runs a
+          real argon2 check against a dummy hash, so lookup time doesn't leak
+          whether the username exists)
+       2. the demo/bootstrap credentials, CYBER_AI_USERNAME / CYBER_AI_PASSWORD
+          (hmac.compare_digest, unchanged from earlier phases) -- see "Demo
+          credentials" below for why this still exists and how it's kept
+          separate from real accounts
+   → backend/sessions.py creates an in-memory session for whichever identity
+     matched: a cryptographically random token (secrets.token_urlsafe(32)) that
+     the server maps internally to (user_id, username) -- never a token that
+     itself encodes any of that, so nothing sensitive is exposed even if a
+     cookie were somehow read
    → two cookies are set:
        cyber_ai_session  -- HttpOnly, Secure, SameSite=None -- the actual credential,
                              unreadable by JS
@@ -941,24 +1046,55 @@ POST /auth/login {username, password}
 ```
 
 ```bash
-export CYBER_AI_USERNAME="choose-your-own-local-username"
+export CYBER_AI_USERNAME="choose-your-own-local-username"   # demo/bootstrap only
 export CYBER_AI_PASSWORD="choose-your-own-local-password"
 ```
 
-`SameSite=None` is required (not a weaker choice) because the frontend (`:5173`) and backend
-(`:8000`) are different origins — a stricter SameSite cookie is simply never sent on that
+`SameSite=None` is required (not a weaker choice) because the frontend (`:5173`/`:8080`) and
+backend (`:8000`) are different origins — a stricter SameSite cookie is simply never sent on that
 cross-origin `fetch`. That in turn removes the browser's own CSRF mitigation, which is why the
 double-submit CSRF header exists on top of it. CORS is locked to the exact frontend origin with
 `allow_credentials=True` (never a wildcard) as the other half of that defense.
 
-Sessions are stored in-process (`backend/sessions.py`) and are lost on restart — appropriate for
-this single-process local application; there is no database or Redis dependency for it.
+**Why a stateful session token, not a JWT:** the requirement was a short-lived, revocable access
+token delivered via an HttpOnly cookie rather than `localStorage`. This project already had exactly
+that (Phase 5.2's opaque-token + in-memory-store design) before any user ever registered — Phase 13
+extends it to carry real identity rather than replacing it with a self-contained token like a JWT.
+The deciding factor: `POST /auth/logout` must actually revoke the session, immediately, so a leaked
+cookie can be invalidated server-side — a stateless signed token can't be revoked before its own
+expiry without a separate revocation list, which would just reintroduce the server-side state this
+design avoids in the first place. The session TTL was shortened from 12h to 1h
+(`backend/sessions.py::SESSION_TTL_SECONDS`) to actually be "short-lived" per this phase's
+requirements; there's no refresh-token flow in this scope, so an expired session simply requires
+logging in again.
 
-`GET /auth/me` (public, always `200`) is how the frontend asks "am I logged in?" on startup.
-`POST /auth/logout` destroys the session server-side and clears both cookies. Neither endpoint,
-nor `/auth/login`, ever returns the session token, CSRF token, password, or API key in a response
-body — only the two cookies carry them, and the CSRF cookie carries a value that's useless without
-the paired HttpOnly session cookie a script can't read.
+Sessions are stored in-process (`backend/sessions.py`) and are lost on restart — appropriate for
+this single-process local application; see **Docker Compose** > "Known limitations" for the
+horizontal-scaling implication that follows from that (unchanged from earlier phases — this is a
+pre-existing, documented limitation, not a new one).
+
+`GET /auth/me` (public, always `200`) is how the frontend asks "am I logged in?" on startup, and
+now also returns `user_id` alongside `username` so the frontend can distinguish accounts.
+`POST /auth/logout` destroys the session server-side and clears both cookies. None of
+`/auth/register`, `/auth/login`, `/auth/logout`, or `/auth/me` ever returns the session token, CSRF
+token, password, or password hash in a response body — only the two cookies carry the session
+credential, and the CSRF cookie carries a value that's useless without the paired HttpOnly session
+cookie a script can't read.
+
+**Demo credentials:** `CYBER_AI_USERNAME`/`CYBER_AI_PASSWORD` are kept, deliberately, as a
+bootstrap login path — not because a database exists now that it shouldn't be the only path, but
+because this app still needs to be usable immediately after `docker compose up -d` on a fresh
+checkout (or in CI) before anyone has registered a real account. It is tried *after* the database
+in `backend/services/auth.py::login()`, so it never shadows or conflicts with a real registered
+account of the same name, and it is the only auth codepath that reads those two environment
+variables — there is exactly one login check per username, never two. A session created via this
+path reports `user_id: "demo"`, a sentinel that can never collide with a real database id (an
+auto-incrementing integer).
+
+**Password requirements** (`backend/services/users.py`): usernames are 3-64 characters
+(letters/digits/`._-+`) or a valid-looking email address; passwords are 8-256 characters and must
+contain at least one letter and one digit. Deliberately no entropy meter or breach-list check —
+appropriately scoped for this project, not an enterprise IAM system.
 
 **Known limitation:** if a protected request ever returns `401` (e.g. session expired), the
 frontend drops back to the login page (see `AuthContext`) — but there's no automatic retry of the
@@ -1208,6 +1344,13 @@ docker run -d --name cyber-ai-backend \
   cyber-ai-backend
 ```
 
+No `DATABASE_URL` is set above, and no database container is linked -- the demo/bootstrap login
+(`CYBER_AI_USERNAME`/`PASSWORD`) still works in this configuration (`backend/services/auth.py`
+falls back to it if the database is unreachable; see **Authentication** > "Demo credentials"), but
+`POST /auth/register` and login for any real registered account will fail until a real
+`DATABASE_URL` is provided. For the full stack including the database, use **Docker Compose**
+below instead of wiring containers up by hand.
+
 ### Health check
 
 ```bash
@@ -1258,15 +1401,29 @@ curl -X POST http://localhost:8000/classify \
   Compose** > "Image sizes".
 - No persistent Hugging Face cache volume — the embedding model is re-downloaded from the internet
   on every fresh container start (see "Providing the Chroma vector store" above).
-- Sessions (Phase 5.2) are in-memory in the FastAPI process, same as local dev: restarting the
-  container logs everyone out. Unaffected by containerization, just worth restating here.
+- Sessions (Phase 5.2, extended Phase 13) are in-memory in the FastAPI process, same as local dev:
+  restarting the container logs everyone out (registered accounts themselves are unaffected --
+  only active sessions are lost). Unaffected by containerization, just worth restating here.
 
 ## Docker Compose
 
 Phase 6.2 (frontend) and 6.3 (Compose) build on **Docker Backend** above: a second image for the
 React frontend, and a `docker-compose.yml` that wires both together. Ollama is deliberately **not**
 a Compose service — it keeps running on the host exactly as in every other phase and local dev
-(see **Docker Backend** > "Connecting to Ollama" for why).
+(see **Docker Backend** > "Connecting to Ollama" for why). Phase 13 adds a third service, `db`
+(PostgreSQL), for persistent user accounts — see **Database Architecture** above for the full
+schema/engine rationale; this section covers only its Compose wiring.
+
+```bash
+docker compose up -d          # backend, frontend, and db all start; backend waits for
+                               # db's healthcheck before starting, and applies pending
+                               # Alembic migrations automatically (Dockerfile CMD)
+```
+
+`db` publishes no host port at all (unlike backend/frontend below) — only the backend container
+ever needs to reach it, over the internal `cyber-ai-net` network, at the Compose service hostname
+`db:5432`. Its data directory is a named volume (`cyber_ai_postgres_data`), so accounts survive
+`docker compose down` (but not `docker compose down -v`, which also removes named volumes).
 
 ### Frontend image
 
@@ -1336,6 +1493,10 @@ Same two mounts, and the same reasoning, as **Docker Backend** above:
 Backend** > "Build") because `backend/services/knowledge_base.py` reads it at request time, not
 just at ingestion time.
 
+`db`'s data directory (`/var/lib/postgresql/data`) is a **named volume**
+(`cyber_ai_postgres_data`), not a bind mount — Postgres manages its own on-disk format there and
+doesn't need host-side access to those files the way the two bind mounts above do.
+
 ### Configuration
 
 ```bash
@@ -1345,19 +1506,27 @@ docker compose up -d --build
 ```
 
 `.env.example` documents every variable Compose reads (`CYBER_AI_API_KEY`, `CYBER_AI_USERNAME`,
-`CYBER_AI_PASSWORD`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `CORS_ORIGINS`, `VITE_API_URL`) with placeholder
-values only. `docker-compose.yml` fails fast (`${VAR:?...}` syntax) if the three auth variables
-aren't set, rather than silently starting an effectively-unauthenticated backend.
+`CYBER_AI_PASSWORD`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `OLLAMA_HOST`,
+`OLLAMA_MODEL`, `CORS_ORIGINS`, `VITE_API_URL`) with placeholder values only. `docker-compose.yml`
+fails fast (`${VAR:?...}` syntax) if the three auth variables or `POSTGRES_PASSWORD` aren't set,
+rather than silently starting an effectively-unauthenticated backend or an unset database password.
+`backend`'s `DATABASE_URL` is derived automatically from the three `POSTGRES_*` variables and the
+`db` service's Compose hostname — set `DATABASE_URL` directly only to point at a different database
+entirely.
 
 ### Health checks
 
-Both services define a Compose `healthcheck`; `frontend` uses `depends_on: backend: condition:
-service_healthy`, so `docker compose up` brings the backend up first. The frontend's healthcheck
-(`wget --spider http://127.0.0.1/`) only proves nginx is serving `index.html` — it says nothing
-about the backend, Ollama, or the vector store, since nginx never talks to any of them. It targets
-`127.0.0.1` explicitly, not `localhost`: the container's `/etc/hosts` resolves `localhost` to
-`::1` first, but `nginx.conf` only binds IPv4 (`listen 80;`), so `wget http://localhost/` fails
-with "Connection refused" even though the server is up — found live while verifying this phase.
+All three services define a Compose `healthcheck`. `backend` uses `depends_on: db: condition:
+service_healthy` (so migrations never run against a database that isn't accepting connections yet
+— see **Database Architecture**), and `frontend` uses `depends_on: backend: condition:
+service_healthy`, so `docker compose up` brings them up in dependency order: `db` → `backend` →
+`frontend`. `db`'s healthcheck is `pg_isready`, the standard Postgres readiness probe. The
+frontend's healthcheck (`wget --spider http://127.0.0.1/`) only proves nginx is serving
+`index.html` — it says nothing about the backend, Ollama, the database, or the vector store, since
+nginx never talks to any of them. It targets `127.0.0.1` explicitly, not `localhost`: the
+container's `/etc/hosts` resolves `localhost` to `::1` first, but `nginx.conf` only binds IPv4
+(`listen 80;`), so `wget http://localhost/` fails with "Connection refused" even though the server
+is up — found live while verifying this phase.
 
 ### Testing / live verification performed
 

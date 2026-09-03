@@ -41,6 +41,38 @@
 # file, and the healthcheck definitions.
 
 services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    # No published port, even to loopback -- only the backend container needs to
+    # reach this, over cyber-ai-net. Minimizes exposed surface, matching this file's
+    # general "loopback-bound at most, reverse proxy in front" posture above.
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cyber_ai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.prod (see .env.prod.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-cyber_ai}
+    volumes:
+      - cyber_ai_postgres_data:/var/lib/postgresql/data
+    read_only: true
+    tmpfs:
+      # Postgres needs to write its Unix socket + a couple of scratch/lock files
+      # here even with everything else on the read-only named volume above.
+      - /var/run/postgresql
+      - /tmp
+    networks:
+      - cyber-ai-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cyber_ai} -d ${POSTGRES_DB:-cyber_ai}"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+
   backend:
     build:
       context: .
@@ -53,6 +85,7 @@ services:
       CYBER_AI_API_KEY: ${CYBER_AI_API_KEY:?Set CYBER_AI_API_KEY in .env.prod (see .env.prod.example)}
       CYBER_AI_USERNAME: ${CYBER_AI_USERNAME:?Set CYBER_AI_USERNAME in .env.prod (see .env.prod.example)}
       CYBER_AI_PASSWORD: ${CYBER_AI_PASSWORD:?Set CYBER_AI_PASSWORD in .env.prod (see .env.prod.example)}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-cyber_ai}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cyber_ai}}
       OLLAMA_HOST: ${OLLAMA_HOST:?Set OLLAMA_HOST in .env.prod -- see README "Where does the LLM run?"}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
       CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS in .env.prod to your real HTTPS origin(s), e.g. https://app.example.com}
@@ -73,6 +106,9 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - cyber-ai-net
+    depends_on:
+      db:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
       interval: 30s
@@ -128,3 +164,5 @@ volumes:
   # restarts/recreations -- without this, a fresh container re-downloads ~80MB from
   # huggingface.co on first request every time (see README "Persistence & State").
   hf_cache:
+  # Persists Postgres's data directory (Phase 13's users table) across restarts.
+  cyber_ai_postgres_data:

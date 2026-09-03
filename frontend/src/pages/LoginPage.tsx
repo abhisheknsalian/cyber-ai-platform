@@ -1,6 +1,7 @@
 import { ShieldHalf } from "lucide-react";
 import { useState } from "react";
 import type { FormEvent } from "react";
+import { Link } from "react-router-dom";
 
 import { Card } from "../components/common/Card";
 import { useAuth } from "../context/AuthContext";
@@ -27,12 +28,21 @@ export function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-surface px-4">
-      <Card className="w-full max-w-sm p-8">
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden px-4">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute left-1/2 top-1/2 h-[560px] w-[560px] -translate-x-1/2 -translate-y-1/2 rounded-full"
+        style={{
+          background: "radial-gradient(circle, color-mix(in srgb, var(--color-accent) 12%, transparent), transparent 70%)",
+        }}
+      />
+      <Card glow="accent" className="relative w-full max-w-sm p-8">
         <div className="mb-6 flex flex-col items-center gap-2 text-center">
           <ShieldHalf className="h-8 w-8 text-accent" strokeWidth={1.75} />
-          <p className="text-sm font-semibold tracking-wide text-text">CYBER AI</p>
-          <p className="text-xs text-text-muted">Sign in to the Threat Intelligence Platform</p>
+          <p className="text-sm font-semibold tracking-[0.2em] text-text">CYBER AI</p>
+          <p className="font-mono text-[11px] uppercase tracking-wider text-text-faint">
+            Threat Intelligence Platform
+          </p>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -49,7 +59,7 @@ export function LoginPage() {
               autoComplete="username"
               value={username}
               onChange={(event) => setUsername(event.target.value)}
-              className="w-full rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-text focus:border-accent focus:outline-none"
+              className="w-full rounded-md border border-border-strong bg-surface-sunken px-3 py-2 font-mono text-sm text-text focus:border-accent focus:outline-none"
               required
             />
           </div>
@@ -67,13 +77,13 @@ export function LoginPage() {
               autoComplete="current-password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
-              className="w-full rounded-md border border-border-strong bg-surface px-3 py-2 text-sm text-text focus:border-accent focus:outline-none"
+              className="w-full rounded-md border border-border-strong bg-surface-sunken px-3 py-2 font-mono text-sm text-text focus:border-accent focus:outline-none"
               required
             />
           </div>
 
           {error ? (
-            <p className="rounded-md border border-severity-critical/30 bg-severity-critical/5 px-3 py-2 text-sm text-severity-critical">
+            <p role="alert" className="rounded-md border border-malicious/30 bg-malicious/5 px-3 py-2 text-sm text-malicious-strong">
               {error}
             </p>
           ) : null}
@@ -86,6 +96,17 @@ export function LoginPage() {
             {submitting ? "Signing in…" : "Sign in"}
           </button>
         </form>
+
+        <p className="mt-6 text-center font-mono text-[11px] text-text-faint">
+          No account yet?{" "}
+          <Link to="/register" className="text-accent hover:text-accent-strong">
+            Create one
+          </Link>
+        </p>
+
+        <p className="mt-3 text-center font-mono text-[10px] uppercase tracking-wider text-text-faint">
+          Local-first · No external services
+        </p>
       </Card>
     </div>
   );

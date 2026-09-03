@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -115,6 +116,29 @@ class AuthStatusResponse(BaseModel):
 
     authenticated: bool
     username: str | None = None
+    # "demo" for the env-credential bootstrap login (backend/services/auth.py), the
+    # user's database id (as a string) for a registered account, or None when
+    # unauthenticated. Never a value that could be used as a credential on its own.
+    user_id: str | None = None
+
+
+class RegisterRequest(BaseModel):
+    """POST /auth/register body. Validation beyond "non-empty" (username shape,
+    password strength, duplicate detection) happens in backend/services/users.py,
+    not here -- those rules are also needed for programmatic callers of that module,
+    so keeping this schema thin avoids duplicating them."""
+
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+class UserPublicResponse(BaseModel):
+    """POST /auth/register's response. Deliberately excludes password and
+    password_hash -- see backend/services/users.py::UserPublic, which this mirrors."""
+
+    id: str
+    username: str
+    created_at: datetime
 
 
 class ThreatAnalysis(BaseModel):

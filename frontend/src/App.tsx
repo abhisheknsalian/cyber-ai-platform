@@ -6,6 +6,7 @@ import { AboutPage } from "./pages/AboutPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { LoginPage } from "./pages/LoginPage";
 import { NetworkDetectionPage } from "./pages/NetworkDetectionPage";
+import { RegisterPage } from "./pages/RegisterPage";
 import { ThreatAnalysisPage } from "./pages/ThreatAnalysisPage";
 import { ThreatIntelligencePage } from "./pages/ThreatIntelligencePage";
 
@@ -15,14 +16,18 @@ function AuthGate() {
   if (!ready) {
     // Avoids flashing the login page (or the app) before GET /auth/me resolves.
     return (
-      <div className="flex min-h-screen items-center justify-center bg-surface text-sm text-text-muted">
-        Loading…
-      </div>
+      <div className="flex min-h-screen items-center justify-center text-sm text-text-muted">Loading…</div>
     );
   }
 
   if (!authenticated) {
-    return <LoginPage />;
+    return (
+      <Routes>
+        <Route path="/register" element={<RegisterPage />} />
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="*" element={<LoginPage />} />
+      </Routes>
+    );
   }
 
   return (

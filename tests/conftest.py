@@ -17,10 +17,20 @@ _TEST_DATASET_PATH = _TEST_ML_DIR / "synthetic_traffic.csv"
 os.environ["DDOS_DATASET_PATH"] = str(_TEST_DATASET_PATH)
 os.environ["ML_MODEL_DIR"] = str(_TEST_ML_DIR / "models")
 
+# Isolated SQLite file per test run (Phase 13's users table) -- schema is created
+# directly from the ORM models below rather than via Alembic, the standard shortcut
+# for tests (see backend/db/session.py / alembic/env.py for how the app and real
+# deployments provision this instead).
+_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="cyber_ai_test_db_"))
+os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_DIR / 'test.db'}"
+
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 
+from backend.db.base import Base  # noqa: E402
+from backend.db.models import User  # noqa: E402,F401
+from backend.db.session import get_engine, session_scope  # noqa: E402
 from backend.ml.config import FEATURE_COLUMNS  # noqa: E402
 from backend.ml.train import train as train_model  # noqa: E402
 from backend.rag.ingestion import build_vector_store  # noqa: E402
@@ -65,6 +75,26 @@ def _test_ml_model():
     train_model()
     yield
     shutil.rmtree(_TEST_ML_DIR, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _test_database():
+    Base.metadata.create_all(bind=get_engine())
+    yield
+    shutil.rmtree(_TEST_DB_DIR, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _reset_users_table():
+    """Phase 13 added a persistent `users` table. Without a reset between tests,
+    registration/login tests that reuse a username (e.g. across test_auth_register.py
+    and test_session_auth.py) would collide on the unique username constraint --
+    autouse so it applies globally, same pattern as _reset_rate_limiters below."""
+    with session_scope() as db:
+        db.query(User).delete()
+    yield
+    with session_scope() as db:
+        db.query(User).delete()
 
 
 @pytest.fixture(autouse=True)

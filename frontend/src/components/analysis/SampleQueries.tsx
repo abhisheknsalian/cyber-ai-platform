@@ -13,14 +13,16 @@ interface SampleQueriesProps {
 export function SampleQueries({ onSelect }: SampleQueriesProps) {
   return (
     <div>
-      <p className="mb-2 text-xs font-medium uppercase tracking-wide text-text-muted">Example queries</p>
+      <p className="mb-2 font-mono text-[11px] font-semibold uppercase tracking-[0.15em] text-text-faint">
+        Quick Investigations
+      </p>
       <div className="flex flex-wrap gap-2">
         {SAMPLE_QUERIES.map((query) => (
           <button
             key={query}
             type="button"
             onClick={() => onSelect(query)}
-            className="rounded-full border border-border-strong bg-surface-hover px-3 py-1.5 text-xs text-text-muted transition-colors hover:border-accent/50 hover:text-text"
+            className="rounded-md border border-border-strong bg-surface-hover px-3 py-1.5 text-xs text-text-muted transition-colors hover:border-accent/50 hover:text-text"
           >
             {query}
           </button>

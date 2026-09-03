@@ -14,8 +14,33 @@
 #
 # All backend secrets/config come from environment variables substituted from a root
 # .env file (never committed -- see .env.example for the placeholder template).
+#
+# Phase 13 adds the `db` service below: a dedicated PostgreSQL instance for this
+# project's persistent user accounts (backend/db/, alembic/). Deliberately its own
+# service/container/named volume/network-scoped hostname -- it never publishes a host
+# port, so it cannot collide with an unrelated Postgres container (e.g. a
+# "sqlgpt-postgres" for a different project) that might already be running on this
+# machine. See README "Database Architecture".
 
 services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cyber_ai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-cyber_ai}
+    volumes:
+      - cyber_ai_postgres_data:/var/lib/postgresql/data
+    networks:
+      - cyber-ai-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cyber_ai} -d ${POSTGRES_DB:-cyber_ai}"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
   backend:
     build:
       context: .
@@ -31,6 +56,10 @@ services:
       CYBER_AI_API_KEY: ${CYBER_AI_API_KEY:?Set CYBER_AI_API_KEY in .env (see .env.example)}
       CYBER_AI_USERNAME: ${CYBER_AI_USERNAME:?Set CYBER_AI_USERNAME in .env (see .env.example)}
       CYBER_AI_PASSWORD: ${CYBER_AI_PASSWORD:?Set CYBER_AI_PASSWORD in .env (see .env.example)}
+      # Points at the dedicated `db` service above by default -- only the Compose
+      # network-internal hostname/port, never a host-published one. Override to point
+      # at a different database entirely (e.g. local SQLite) without a code change.
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-cyber_ai}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cyber_ai}}
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
       # Includes both the Vite dev-server origin (so a non-Dockerized frontend can
@@ -51,6 +80,9 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - cyber-ai-net
+    depends_on:
+      db:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
       interval: 30s
@@ -81,3 +113,10 @@ services:
 networks:
   cyber-ai-net:
     driver: bridge
+
+volumes:
+  # Persists Postgres's data directory across container restarts/recreations. Named
+  # (not bind-mounted) so it's managed entirely by Docker and namespaced to this
+  # Compose project -- `docker volume ls` shows it as
+  # <project>_cyber_ai_postgres_data, distinct from any unrelated project's volumes.
+  cyber_ai_postgres_data:

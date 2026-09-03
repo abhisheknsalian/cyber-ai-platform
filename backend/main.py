@@ -35,14 +35,17 @@ from backend.models.schemas import (
     LoginRequest,
     ReadinessChecks,
     ReadinessResponse,
+    RegisterRequest,
     ThreatAnalysis,
     ThreatCategory,
+    UserPublicResponse,
 )
 from backend.rag.config import COLLECTION_NAME
 from backend.rag.retrieval import vector_store_available, vector_store_chunk_count
 from backend.rate_limit import enforce_ai_rate_limit, enforce_login_rate_limit
 from backend.security import require_auth
 from backend.services import auth as auth_service
+from backend.services import users as users_service
 from backend.services.classification import UnsupportedPredictionError, classify_and_analyze
 from backend.services.knowledge_base import list_threat_categories
 from backend.services.llm import LLMResponseError, LLMUnavailableError
@@ -52,7 +55,7 @@ from backend.sessions import (
     CSRF_COOKIE_NAME,
     SESSION_COOKIE_NAME,
     SESSION_TTL_SECONDS,
-    is_valid_session,
+    session_identity,
 )
 
 configure_logging(level=logging.INFO)
@@ -153,6 +156,33 @@ def home():
     return {"message": "Cyber AI Platform Running"}
 
 
+@app.post("/auth/register", response_model=UserPublicResponse, status_code=201)
+def register(
+    payload: RegisterRequest,
+    _: None = Depends(enforce_login_rate_limit),
+) -> UserPublicResponse:
+    """Create a new persistent user account. Public, rate-limited by the same
+    per-IP budget as /auth/login (RATE_LIMIT_LOGIN_MAX) -- both are unauthenticated
+    endpoints that touch the password-hashing path, the same abuse surface, so they
+    share one budget rather than doubling a caller's effective quota by splitting it
+    across two endpoints (same reasoning AI_RATE_LIMIT already applies to /analyze,
+    /classify, /analyze/classification). Does not log the user in -- see README
+    "Authentication" for the registration flow.
+    """
+    try:
+        user = auth_service.register(payload.username, payload.password)
+    except users_service.InvalidRegistrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except users_service.UsernameTakenError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception:
+        logger.exception("Unexpected error during registration")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while registering.")
+
+    logger.info("Registration succeeded", extra={"event": "register_success"})
+    return UserPublicResponse(id=user.id, username=user.username, created_at=user.created_at)
+
+
 @app.post("/auth/login", response_model=AuthStatusResponse)
 def login(
     payload: LoginRequest,
@@ -160,9 +190,11 @@ def login(
     _: None = Depends(enforce_login_rate_limit),
 ) -> AuthStatusResponse:
     """Browser session login. Public (rate-limited by IP). Never logs or echoes the
-    username or password -- only whether the attempt succeeded."""
+    username or password -- only whether the attempt succeeded. Accepts either a
+    registered account or the demo/bootstrap credentials -- see
+    backend/services/auth.py for how the two are tried and kept separate."""
     try:
-        session_token, csrf_token = auth_service.login(payload.username, payload.password)
+        session_token, csrf_token, user_id, username = auth_service.login(payload.username, payload.password)
     except auth_service.InvalidCredentialsError:
         logger.warning("Login failed", extra={"event": "login_failure"})
         raise HTTPException(status_code=401, detail="Invalid username or password.")
@@ -172,7 +204,7 @@ def login(
 
     logger.info("Login succeeded", extra={"event": "login_success"})
     _set_auth_cookies(response, session_token, csrf_token)
-    return AuthStatusResponse(authenticated=True, username=payload.username)
+    return AuthStatusResponse(authenticated=True, username=username, user_id=user_id)
 
 
 @app.post("/auth/logout", response_model=AuthStatusResponse)
@@ -188,8 +220,11 @@ def logout(request: Request, response: Response) -> AuthStatusResponse:
 def me(request: Request) -> AuthStatusResponse:
     """Reports whether the current browser session is authenticated. Public --
     this is how the frontend asks "am I logged in?" without ever erroring."""
-    authenticated = is_valid_session(request.cookies.get(SESSION_COOKIE_NAME))
-    return AuthStatusResponse(authenticated=authenticated, username=os.getenv("CYBER_AI_USERNAME") if authenticated else None)
+    identity = session_identity(request.cookies.get(SESSION_COOKIE_NAME))
+    if identity is None:
+        return AuthStatusResponse(authenticated=False)
+    user_id, username = identity
+    return AuthStatusResponse(authenticated=True, username=username, user_id=user_id)
 
 
 @app.get("/health", response_model=HealthResponse)

@@ -1,6 +1,7 @@
 /** Mirrors backend/ml/schemas.py and backend/ml/config.py exactly. */
 
 import type { ThreatAnalysis } from "./api";
+import type { HybridEvidence } from "./intelligence";
 
 /** The 78 CICFlowMeter feature columns the Random Forest model was trained on, in
  * the exact order backend/ml/config.py uses. Used only to build the "fill example"
@@ -89,7 +90,10 @@ export const FEATURE_COLUMNS = [
 /** A CICFlowMeter feature vector keyed by the exact column names above. */
 export type NetworkTrafficFeatures = Record<string, number>;
 
-export type ClassifierPrediction = "BENIGN" | "DDoS";
+/** str server-side (backend/ml/schemas.py), validated at runtime against LABEL_MAP --
+ * not a hardcoded Literal, so a future class (multi-class-ready pipeline) doesn't
+ * require a frontend type edit. Today LABEL_MAP is still {"BENIGN", "DDoS"}. */
+export type ClassifierPrediction = string;
 
 export interface ClassificationResult {
   prediction: ClassifierPrediction;
@@ -98,6 +102,12 @@ export interface ClassificationResult {
   probability: number | null;
   model: "random_forest";
   classification: "malicious" | "benign";
+  /** The complete predict_proba() vector keyed by class label, e.g.
+   * { BENIGN: 0.02, DDoS: 0.98 }. None if the loaded model has no predict_proba. */
+  class_probabilities: Record<string, number> | null;
+  /** The trained artifact's `trained_at` timestamp, or null if no metadata file is
+   * present. */
+  model_version: string | null;
 }
 
 export interface FeatureImportanceItem {
@@ -114,4 +124,7 @@ export interface ClassificationAnalysisResponse {
   classification: ClassificationResult;
   /** null when classification is "benign" -- there is no threat to analyze. */
   analysis: ThreatAnalysis | null;
+  /** The hybrid evidence bundle backing `analysis` (classifier + vector + graph).
+   * null whenever `analysis` is null. */
+  evidence: HybridEvidence | null;
 }

@@ -56,3 +56,14 @@ export interface HealthResponse {
   vector_store: VectorStoreStatus;
   llm: LLMStatus;
 }
+
+export interface ReadinessChecks {
+  vector_store: boolean;
+  llm: boolean;
+  classifier: boolean;
+}
+
+export interface ReadinessResponse {
+  ready: boolean;
+  checks: ReadinessChecks;
+}

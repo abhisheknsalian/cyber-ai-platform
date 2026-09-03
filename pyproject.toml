@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.13.2",
+    "argon2-cffi>=23.1.0",
     "chromadb>=1.5.9",
     "fastapi>=0.141.1",
     "ipykernel>=7.2.0",
@@ -19,8 +21,10 @@ dependencies = [
     "numpy>=2.4.4",
     "ollama>=0.6.2",
     "pandas>=3.0.3",
+    "psycopg[binary]>=3.2.3",
     "scikit-learn>=1.8.0",
     "sentence-transformers>=6.0.0",
+    "sqlalchemy>=2.0.36",
     "uvicorn[standard]>=0.52.4",
 ]
 

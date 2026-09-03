@@ -1,23 +1,51 @@
 @import "tailwindcss";
 
+/* Deep teal / green-black SOC theme. Every surface, border and text color the app
+   uses comes from this one block -- retint here, not per-component. */
 @theme {
-  --color-surface: #0a0e16;
-  --color-surface-raised: #10151f;
-  --color-surface-hover: #161d2b;
-  --color-border: #232b3b;
-  --color-border-strong: #303c52;
-  --color-text: #e7eaf1;
-  --color-text-muted: #8b93a7;
-  --color-text-faint: #5b6478;
-  --color-accent: #22d3ee;
-  --color-accent-strong: #06b6d4;
-  --color-severity-low: #60a5fa;
-  --color-severity-medium: #fbbf24;
-  --color-severity-high: #fb923c;
-  --color-severity-critical: #f87171;
+  --color-surface: #04110f;
+  --color-surface-raised: #0a211f;
+  --color-surface-hover: #0f2c29;
+  --color-surface-sunken: #020b0a;
+  --color-border: #123430;
+  --color-border-strong: #1d4c46;
+  --color-border-active: #2a6e64;
+  --color-text: #e6f5f1;
+  --color-text-muted: #8fb5ad;
+  --color-text-faint: #4e7972;
 
+  --color-accent: #17e6ce;
+  --color-accent-strong: #05c6b0;
+  --color-accent-soft: #17e6ce1a;
+
+  --color-malicious: #f1545c;
+  --color-malicious-strong: #ff8288;
+  --color-benign: #21d9a6;
+  --color-benign-strong: #6eefc7;
+  --color-warning: #e7b443;
+  --color-ai: #6fe0ce;
+
+  --color-severity-low: #4e9de0;
+  --color-severity-medium: #e7b443;
+  --color-severity-high: #f0914a;
+  --color-severity-critical: #f1545c;
+
+  /* System stacks only -- no remote font fetch, consistent with this platform's
+     local-first posture (no external calls of any kind at rest). */
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+  --animate-pulse-dot: pulse-dot 2s ease-in-out infinite;
+  --animate-fade-in: fade-in 0.25s ease-out;
+  --animate-scan: scan 2.4s linear infinite;
+}
+
+:root {
+  /* One small tiled SVG of faint right-angle circuit traces + node points, layered
+     into the body background below. Pure inline data URI -- no image asset, no
+     charting/particle library. Alpha is baked into the SVG's own stroke/fill so it
+     stays a barely-there atmosphere layer rather than a competing graphic. */
+  --bg-circuit: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='340' height='340' viewBox='0 0 340 340'%3E%3Cg fill='none' stroke='rgba(23,230,206,0.05)' stroke-width='1'%3E%3Cpath d='M20 40 H140 V120 H260 V200'/%3E%3Cpath d='M300 20 V100 H200 V180 H60 V300'/%3E%3Cpath d='M40 260 H160 V340'/%3E%3Cpath d='M320 260 H240 V340'/%3E%3C/g%3E%3Cg fill='rgba(23,230,206,0.09)'%3E%3Ccircle cx='140' cy='120' r='2.5'/%3E%3Ccircle cx='260' cy='200' r='2.5'/%3E%3Ccircle cx='200' cy='180' r='2.5'/%3E%3Ccircle cx='60' cy='300' r='2.5'/%3E%3Ccircle cx='160' cy='340' r='2'/%3E%3Ccircle cx='240' cy='340' r='2'/%3E%3Ccircle cx='20' cy='40' r='2'/%3E%3Ccircle cx='300' cy='20' r='2'/%3E%3C/g%3E%3C/svg%3E");
 }
 
 html,
@@ -29,6 +57,29 @@ body,
 body {
   margin: 0;
   background-color: var(--color-surface);
+  /* Layered deep-teal/green-black atmosphere, back to front:
+     minor grid, major grid, circuit traces, two soft cyan glows, edge vignette.
+     Every layer is a gradient or the one small tiled SVG above -- no images,
+     no canvas/WebGL, cheap to paint, and never so strong it competes with content. */
+  background-image:
+    radial-gradient(ellipse 140% 120% at 50% 38%, transparent 45%, color-mix(in srgb, black 60%, transparent) 100%),
+    radial-gradient(ellipse 65% 40% at 50% -8%, color-mix(in srgb, var(--color-accent) 10%, transparent), transparent 70%),
+    radial-gradient(circle 640px at 8% 88%, color-mix(in srgb, var(--color-accent) 5%, transparent), transparent 70%),
+    var(--bg-circuit),
+    linear-gradient(color-mix(in srgb, var(--color-border) 55%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--color-border) 55%, transparent) 1px, transparent 1px),
+    linear-gradient(color-mix(in srgb, var(--color-border) 18%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--color-border) 18%, transparent) 1px, transparent 1px);
+  background-size:
+    100% 100%,
+    100% 100%,
+    100% 100%,
+    340px 340px,
+    64px 64px,
+    64px 64px,
+    16px 16px,
+    16px 16px;
+  background-attachment: fixed;
   color: var(--color-text);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
@@ -41,4 +92,86 @@ body {
 
 ::selection {
   background: color-mix(in srgb, var(--color-accent) 30%, transparent);
+}
+
+/* Uniform, visible focus ring for keyboard navigation across every interactive
+   element -- relied on instead of per-component focus styling. */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--color-border-strong);
+  border-radius: 999px;
+  border: 2px solid var(--color-surface);
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent);
+  }
+  50% {
+    opacity: 0.65;
+    box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 0%, transparent);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scan {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes confidence-fill {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+.animate-confidence-fill {
+  transform-origin: left;
+  animation: confidence-fill 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Every purposeful animation above is decorative, not load-bearing for
+   comprehension -- safe to fully disable. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }

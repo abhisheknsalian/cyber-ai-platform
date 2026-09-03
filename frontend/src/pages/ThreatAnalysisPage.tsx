@@ -41,8 +41,9 @@ export function ThreatAnalysisPage() {
   return (
     <div>
       <PageHeader
-        title="Threat Analysis"
-        description="Analyze a cybersecurity threat using retrieval-augmented generation over a local knowledge base and a local LLM."
+        eyebrow="Retrieval-Augmented Generation · Local LLM"
+        title="AI Threat Analysis"
+        description="Ask a cybersecurity question and get a structured intelligence report grounded in the local threat-intelligence knowledge base and a local Llama 3.2 model -- not a general-purpose chatbot."
       />
 
       <Card className="p-5">
@@ -52,7 +53,7 @@ export function ThreatAnalysisPage() {
           onSubmit={() => runAnalysis(query)}
           disabled={request.status === "loading"}
         />
-        <div className="mt-4">
+        <div className="mt-4 border-t border-border pt-4">
           <SampleQueries onSelect={(sample) => setQuery(sample)} />
         </div>
       </Card>

@@ -40,6 +40,12 @@ Thumbs.db
 
 data/raw/
 
+# Local-dev SQLite database (Phase 13's users table) -- default DATABASE_URL target
+# for non-Docker local dev; contains real (hashed) user accounts, never committed.
+# See backend/db/session.py and README "Database Architecture".
+data/cyber_ai.db
+data/cyber_ai.db-*
+
 # docker-compose.yml reads a root .env by convention (never committed; see
 # .env.example for the placeholder template). docker-compose.prod.yml reads .env.prod
 # the same way (Phase 12) -- see .env.prod.example for its placeholder template.

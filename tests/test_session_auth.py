@@ -53,7 +53,9 @@ def test_login_success(client):
     response = _login(client)
     assert response.status_code == 200
     body = response.json()
-    assert body == {"authenticated": True, "username": USERNAME}
+    # Phase 13: the demo/bootstrap credential path (backend/services/auth.py) always
+    # reports the "demo" sentinel user_id -- it's never backed by a real database row.
+    assert body == {"authenticated": True, "username": USERNAME, "user_id": "demo"}
     assert SESSION_COOKIE_NAME in client.cookies
     assert CSRF_COOKIE_NAME in client.cookies
 
@@ -83,7 +85,7 @@ def test_logout_destroys_session(client):
 
     logout_response = client.post("/auth/logout", headers=_csrf_header(client))
     assert logout_response.status_code == 200
-    assert logout_response.json() == {"authenticated": False, "username": None}
+    assert logout_response.json() == {"authenticated": False, "username": None, "user_id": None}
 
     # The old session token must no longer work even if a client kept it around.
     client.cookies.set(SESSION_COOKIE_NAME, session_cookie_before)
@@ -100,14 +102,14 @@ def test_logout_without_a_session_is_a_safe_no_op(client):
 def test_auth_me_unauthenticated(client):
     response = client.get("/auth/me")
     assert response.status_code == 200
-    assert response.json() == {"authenticated": False, "username": None}
+    assert response.json() == {"authenticated": False, "username": None, "user_id": None}
 
 
 def test_auth_me_authenticated(client):
     _login(client)
     response = client.get("/auth/me")
     assert response.status_code == 200
-    assert response.json() == {"authenticated": True, "username": USERNAME}
+    assert response.json() == {"authenticated": True, "username": USERNAME, "user_id": "demo"}
 
 
 # ---------------------------------------------------------------------------

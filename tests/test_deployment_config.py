@@ -31,12 +31,28 @@ def prod_compose() -> dict:
 
 
 def test_prod_compose_is_valid_yaml_with_expected_services(prod_compose):
-    assert set(prod_compose["services"]) == {"backend", "frontend"}
+    # Phase 13 adds `db` (dedicated Postgres for persistent user accounts).
+    assert set(prod_compose["services"]) == {"backend", "frontend", "db"}
 
 
 def test_prod_compose_backend_and_frontend_are_read_only(prod_compose):
-    for service in ("backend", "frontend"):
+    for service in ("backend", "frontend", "db"):
         assert prod_compose["services"][service]["read_only"] is True
+
+
+def test_prod_compose_db_has_no_published_ports(prod_compose):
+    """Unlike backend/frontend (loopback-only, see below), `db` publishes no port at
+    all -- only the backend container ever needs to reach it, over cyber-ai-net."""
+    assert "ports" not in prod_compose["services"]["db"]
+
+
+def test_prod_compose_db_has_no_hardcoded_secret_values(prod_compose):
+    value = prod_compose["services"]["db"]["environment"]["POSTGRES_PASSWORD"]
+    assert value.startswith("${"), f"POSTGRES_PASSWORD must be a variable reference, not a literal value: {value!r}"
+
+
+def test_prod_compose_backend_depends_on_db_being_healthy(prod_compose):
+    assert prod_compose["services"]["backend"]["depends_on"]["db"]["condition"] == "service_healthy"
 
 
 def test_prod_compose_publishes_ports_to_loopback_only(prod_compose):
@@ -81,7 +97,7 @@ def test_env_prod_example_exists_and_contains_no_real_looking_secrets():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        if key in {"CYBER_AI_API_KEY", "CYBER_AI_USERNAME", "CYBER_AI_PASSWORD"}:
+        if key in {"CYBER_AI_API_KEY", "CYBER_AI_USERNAME", "CYBER_AI_PASSWORD", "POSTGRES_PASSWORD"}:
             # Must be blank (the operator fills it in) or a documented placeholder --
             # never a real-looking secret committed to this template.
             assert value == "" or value in _PLACEHOLDER_VALUES, (

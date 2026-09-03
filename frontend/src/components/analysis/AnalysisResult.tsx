@@ -1,12 +1,17 @@
-import { ExternalLink, FileText, ShieldAlert } from "lucide-react";
+import { ExternalLink, FileText, GitBranch, ShieldAlert } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { ThreatAnalysis } from "../../types/api";
+import type { HybridEvidence } from "../../types/intelligence";
 import { Card } from "../common/Card";
 import { SeverityBadge } from "../common/SeverityBadge";
 
 interface AnalysisResultProps {
   result: ThreatAnalysis;
+  /** The hybrid evidence bundle behind this analysis (classifier/vector/graph),
+   * when it came from POST /analyze/classification. null/undefined for a plain
+   * /analyze query, which doesn't return one. */
+  evidence?: HybridEvidence | null;
 }
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
@@ -36,10 +41,17 @@ function TagList({ items }: { items: string[] }) {
   );
 }
 
-export function AnalysisResult({ result }: AnalysisResultProps) {
+const RELATION_LABEL: Record<string, string> = {
+  USES: "Uses",
+  HAS_INDICATOR: "Indicator",
+  MITIGATED_BY: "Mitigated by",
+  SUPPORTED_BY: "Sourced from",
+};
+
+export function AnalysisResult({ result, evidence }: AnalysisResultProps) {
   return (
     <div className="space-y-6">
-      <Card className="p-6">
+      <Card className="p-6" glow="accent">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2.5">
             <ShieldAlert className="h-5 w-5 text-accent" strokeWidth={1.75} />
@@ -50,7 +62,8 @@ export function AnalysisResult({ result }: AnalysisResultProps) {
           {result.severity ? <SeverityBadge severity={result.severity} /> : null}
         </div>
 
-        <p className="mt-4 text-sm leading-relaxed text-text-muted">{result.summary}</p>
+        <p className="mt-1 text-[11px] font-medium uppercase tracking-wide text-text-faint">Executive Summary</p>
+        <p className="mt-2 text-sm leading-relaxed text-text-muted">{result.summary}</p>
       </Card>
 
       <Card className="grid grid-cols-1 gap-6 p-6 sm:grid-cols-2">
@@ -96,12 +109,42 @@ export function AnalysisResult({ result }: AnalysisResultProps) {
         </Section>
       </Card>
 
+      {evidence && evidence.graph_evidence.length > 0 ? (
+        <Card className="p-6">
+          <div className="mb-3 flex items-center gap-2">
+            <GitBranch className="h-4 w-4 text-text-muted" strokeWidth={1.75} />
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-text-muted">
+              Related Graph Relationships ({evidence.graph_evidence.length})
+            </h3>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {evidence.graph_evidence.map((relation, index) => (
+              <span
+                key={`${relation.relation}-${relation.target_id}-${index}`}
+                className="rounded-md border border-border-strong bg-surface-hover px-2.5 py-1.5 font-mono text-xs text-text"
+              >
+                <span className="text-text-faint">{RELATION_LABEL[relation.relation] ?? relation.relation}</span>{" "}
+                {relation.target_name}
+              </span>
+            ))}
+          </div>
+        </Card>
+      ) : null}
+
       <Card className="p-6">
-        <div className="mb-3 flex items-center gap-2">
-          <FileText className="h-4 w-4 text-text-muted" strokeWidth={1.75} />
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-text-muted">
-            Sources ({result.sources.length})
-          </h3>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <FileText className="h-4 w-4 text-text-muted" strokeWidth={1.75} />
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-text-muted">
+              Intelligence Sources ({result.sources.length})
+            </h3>
+          </div>
+          {evidence?.vector_duration_ms != null ? (
+            <span className="font-mono text-[11px] text-text-faint">
+              retrieval {evidence.vector_duration_ms.toFixed(1)}ms
+              {evidence.graph_duration_ms != null ? ` · graph ${evidence.graph_duration_ms.toFixed(1)}ms` : ""}
+            </span>
+          ) : null}
         </div>
         <div className="space-y-2">
           {result.sources.map((source, index) => (

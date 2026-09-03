@@ -18,10 +18,10 @@ export function LoadingState() {
   }, []);
 
   return (
-    <Card className="flex flex-col items-center gap-4 p-10 text-center">
+    <Card className="flex flex-col items-center gap-4 p-10 text-center" role="status" aria-live="polite">
       <Loader2 className="h-6 w-6 animate-spin text-accent" strokeWidth={1.75} />
       <p className="text-sm font-medium text-text">Analyzing threat intelligence…</p>
-      <ul className="space-y-1.5 text-xs">
+      <ul className="space-y-1.5 font-mono text-xs">
         {STAGES.map((stage, index) => (
           <li key={stage} className={index <= stageIndex ? "text-accent" : "text-text-faint"}>
             {stage}

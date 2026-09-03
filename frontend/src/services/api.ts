@@ -1,5 +1,5 @@
-import type { AnalyzeRequest, HealthResponse, ThreatAnalysis, ThreatCategory } from "../types/api";
-import type { AuthStatusResponse, LoginRequest } from "../types/auth";
+import type { AnalyzeRequest, HealthResponse, ReadinessResponse, ThreatAnalysis, ThreatCategory } from "../types/api";
+import type { AuthStatusResponse, LoginRequest, RegisterRequest, UserPublic } from "../types/auth";
 import type { ThreatGraphNeighborhood } from "../types/intelligence";
 import type {
   ClassificationAnalysisRequest,
@@ -120,6 +120,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 }
 
+export function register(payload: RegisterRequest): Promise<UserPublic> {
+  return request<UserPublic>("/auth/register", { method: "POST", body: JSON.stringify(payload) });
+}
+
 export function login(payload: LoginRequest): Promise<AuthStatusResponse> {
   return request<AuthStatusResponse>("/auth/login", { method: "POST", body: JSON.stringify(payload) });
 }
@@ -139,6 +143,19 @@ export function analyzeThreat(query: string): Promise<ThreatAnalysis> {
 
 export function getHealth(): Promise<HealthResponse> {
   return request<HealthResponse>("/health");
+}
+
+/** GET /ready reports 503 when a dependency isn't up (unlike /health, which is
+ * always 200 while the process is alive) -- request() would normally throw for
+ * that status, so this reads the body from the raw response instead of routing
+ * through request()'s !response.ok branch. */
+export async function getReadiness(): Promise<ReadinessResponse> {
+  const response = await fetch(`${API_URL}/ready`, { credentials: "include" });
+  try {
+    return (await response.json()) as ReadinessResponse;
+  } catch {
+    throw new ApiError("The backend returned a response that could not be understood.");
+  }
 }
 
 export function getThreats(): Promise<ThreatCategory[]> {
