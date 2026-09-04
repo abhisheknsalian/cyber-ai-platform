@@ -19,6 +19,16 @@ annotator to fill in, never a fabricated score. See write_rubric_template().
 
 Calls backend/services/threat_analysis.py::analyze_query() exactly as POST /analyze
 already does -- no change to production LLM invocation, prompting, or parsing.
+
+Phase 18 (P0.2): the rubric template written by write_rubric_template() now also
+carries `retrieved_context_excerpt` (the same evidence text the LLM's summary/
+attack_vectors were expected to be grounded in, re-fetched via
+backend/evaluation/grounding.py::retrieved_context_text() -- no new retrieval logic)
+and `is_negative_control` (True for the 2 off-topic cases, which have no content to
+judge and must never contribute to a rubric dimension's mean -- see
+backend/evaluation/llm_rubric_scoring.py, the module that actually reads a human's
+filled-in copy of this template). This module still only ever WRITES an empty
+template; it never scores anything itself and never uses an LLM as a judge.
 """
 
 from __future__ import annotations
@@ -44,7 +54,7 @@ for _query, _category in EVALUATION_QUERIES:
 DEFAULT_CASES.append(("What is the capital of France?", None))
 DEFAULT_CASES.append(("Give me a recipe for chocolate chip cookies.", None))
 
-_RUBRIC_DIMENSIONS = [
+RUBRIC_DIMENSIONS = [
     (
         "severity_reasonableness",
         "Is the assigned severity (Low/Medium/High/Critical) a reasonable judgment given the retrieved evidence?",
@@ -58,7 +68,7 @@ _RUBRIC_DIMENSIONS = [
         "Are the listed attack vectors genuinely relevant to and supported by this specific threat's evidence?",
     ),
 ]
-_SCALE_DESCRIPTION = "0 = incorrect, 1 = partially correct, 2 = correct"
+SCALE_DESCRIPTION = "0 = incorrect, 1 = partially correct, 2 = correct"
 
 DEFAULT_RUBRIC_TEMPLATE_PATH = Path("evaluation/llm_rubric_template.csv")
 
@@ -68,16 +78,42 @@ class LLMEvaluationUnavailableError(RuntimeError):
     never fabricates LLM evaluation results."""
 
 
+def score_column_name(dimension_name: str) -> str:
+    """The exact CSV column header write_rubric_template() uses for a given rubric
+    dimension's score -- a single source of truth so
+    backend/evaluation/llm_rubric_scoring.py (which READS a filled-in copy of this
+    template) can never silently drift from what this module WRITES."""
+    return f"{dimension_name}_score (0/1/2, leave blank until annotated)"
+
+
+# Cap on the retrieved-context excerpt written into the rubric template -- purely a
+# defensive ceiling (this project's real threat-intel documents are all under 1KB,
+# see data/threat_intel/*.txt, so this is not expected to ever truncate anything;
+# it exists so a future, larger knowledge base can't silently produce an
+# unreadable multi-page CSV cell).
+_CONTEXT_EXCERPT_MAX_CHARS = 2000
+
+
 def write_rubric_template(rows: list[dict], output_path: Path = DEFAULT_RUBRIC_TEMPLATE_PATH) -> Path:
-    """Writes a CSV with one row per evaluated case and one empty score column per
-    rubric dimension, for a human annotator to fill in. This is the "implement the
+    """Writes a CSV with one row per evaluated case -- query, category, the LLM's
+    generated output, the retrieved evidence it was expected to use, whether the
+    case is a negative (off-topic) control, and one empty score column per rubric
+    dimension -- for a human annotator to fill in. This is the "implement the
     framework, document the required annotation process" path required when human
     judgment is genuinely needed and unavailable -- never a substitute for actually
-    collecting the annotation."""
+    collecting the annotation. Never mutates the LLM's own output fields; the
+    retrieved-context column is additional context, not a replacement value.
+
+    `rows` is expected to already carry `retrieved_context_excerpt` and
+    `is_negative_control` (see run_llm_evaluation()) -- kept as a plain
+    list[dict] parameter (not typed to a specific case model) so this function
+    stays independently testable with hand-built rows, matching the existing
+    Phase 16 convention."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["case_id", "query", "category", "severity", "summary", "attack_vectors"] + [
-        f"{name}_score (0/1/2, leave blank until annotated)" for name, _ in _RUBRIC_DIMENSIONS
-    ]
+    fieldnames = [
+        "case_id", "query", "category", "severity", "summary", "attack_vectors",
+        "retrieved_context_excerpt", "is_negative_control",
+    ] + [score_column_name(name) for name, _ in RUBRIC_DIMENSIONS]
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -97,6 +133,13 @@ def run_llm_evaluation(
         )
 
     cases = cases if cases is not None else DEFAULT_CASES
+
+    # Local import: grounding.py itself imports DEFAULT_CASES from this module at
+    # module level, so a module-level import here would be circular. Reused, not
+    # reimplemented -- the exact same context-fetch helper grounding.py's own
+    # checks call to re-fetch the evidence text a case's output was expected to be
+    # grounded in.
+    from backend.evaluation.grounding import retrieved_context_text
 
     schema_valid = 0
     on_topic_total = 0
@@ -132,6 +175,14 @@ def run_llm_evaluation(
             if result.severity is not None:
                 analyzed_with_severity += 1
 
+        is_negative_control = expected_category is None
+        if is_analyzed:
+            context_excerpt = retrieved_context_text(query, result.threat)[:_CONTEXT_EXCERPT_MAX_CHARS]
+        elif is_negative_control:
+            context_excerpt = "(no retrieved evidence -- off-topic query correctly returned no analysis)"
+        else:
+            context_excerpt = "(no analysis produced for this on-topic case -- see automated status field)"
+
         template_rows.append(
             {
                 "case_id": index,
@@ -140,6 +191,8 @@ def run_llm_evaluation(
                 "severity": result.severity or "",
                 "summary": result.summary,
                 "attack_vectors": "; ".join(result.attack_vectors),
+                "retrieved_context_excerpt": context_excerpt,
+                "is_negative_control": is_negative_control,
             }
         )
 
@@ -160,12 +213,12 @@ def run_llm_evaluation(
         LLMRubricDimension(
             name=name,
             description=description,
-            scale_description=_SCALE_DESCRIPTION,
+            scale_description=SCALE_DESCRIPTION,
             status="not_yet_annotated",
             mean_score=None,
             scores=[],
         )
-        for name, description in _RUBRIC_DIMENSIONS
+        for name, description in RUBRIC_DIMENSIONS
     ]
 
     return LLMEvaluationReport(

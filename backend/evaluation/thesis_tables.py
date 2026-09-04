@@ -23,6 +23,12 @@ def _fmt(value, digits: int = 4) -> str:
     return str(value)
 
 
+def _ci_text(ci, digits: int = 6) -> str:
+    if ci is None:
+        return _NOT_MEASURED
+    return f"[{_fmt(ci.lower, digits)}, {_fmt(ci.upper, digits)}]"
+
+
 def _table_1_ml_performance(report: EvaluationReport) -> str:
     lines = ["## Table 1: ML Classification Performance\n", "| Split | Samples | Accuracy | Precision (macro) | Recall (macro) | F1 (macro) | ROC-AUC | PR-AUC |", "|---|---|---|---|---|---|---|---|"]
     for name, metrics in report.classification.items():
@@ -63,20 +69,31 @@ def _table_2_leakage_generalization(report: EvaluationReport) -> str:
     if ge is not None:
         lines += [
             "",
-            "| Split | Production artifact? | Test rows | Accuracy | F1 (macro) |",
-            "|---|---|---|---|---|",
-            f"| {ge.baseline.split_name} | Yes | {ge.baseline.test_rows} | {_fmt(ge.baseline.accuracy, 6)} | {_fmt(ge.baseline.f1_macro, 6)} |",
+            "| Split | Production artifact? | Sig. digits | % rows constrained | Test rows | Accuracy | 95% Wilson CI | F1 (macro) |",
+            "|---|---|---|---|---|---|---|---|",
+            (
+                f"| {ge.baseline.split_name} | Yes | - | - | {ge.baseline.test_rows} | {_fmt(ge.baseline.accuracy, 6)} | "
+                f"{_ci_text(ge.baseline.accuracy_ci)} | {_fmt(ge.baseline.f1_macro, 6)} |"
+            ),
         ]
-        if ge.family_grouped:
+        # Phase 18 (P0.1): prefer the full multi-granularity sweep when present --
+        # falls back to the single family_grouped point for reports generated
+        # before this sweep existed, so this renderer never crashes on an older
+        # saved JSON.
+        sweep = ge.near_duplicate_controlled_sweep or ([ge.family_grouped] if ge.family_grouped else [])
+        for row in sweep:
             lines.append(
-                f"| {ge.family_grouped.split_name} | No (research-only) | {ge.family_grouped.test_rows} | "
-                f"{_fmt(ge.family_grouped.accuracy, 6)} | {_fmt(ge.family_grouped.f1_macro, 6)} |"
+                f"| {row.split_name} | No (research-only) | {row.significant_digits if row.significant_digits is not None else '-'} | "
+                f"{_fmt(row.fraction_rows_in_multi_row_family, 4) if row.fraction_rows_in_multi_row_family is not None else '-'} | "
+                f"{row.test_rows} | {_fmt(row.accuracy, 6)} | {_ci_text(row.accuracy_ci)} | {_fmt(row.f1_macro, 6)} |"
             )
         rv = ge.repeated_random_splits
         lines.append(
             f"\nRepeated random splits ({len(rv.seeds)} seeds): accuracy mean={_fmt(rv.accuracy_mean, 6)}, "
             f"stddev={_fmt(rv.accuracy_stddev, 6)}"
         )
+        if ge.dose_response_note:
+            lines.append(f"\n**Dose-response interpretation (Phase 18, P0.1 -- descriptive only, not causal):** {ge.dose_response_note}")
     else:
         lines.append(f"\nGeneralization experiment: {_NOT_MEASURED}")
     return "\n".join(lines)
