@@ -4,10 +4,22 @@ import time
 import ollama
 from pydantic import ValidationError
 
+from backend import metrics
 from backend.models.schemas import LLMAnalysisFragment
 from backend.rag.config import OLLAMA_MODEL
 
 logger = logging.getLogger(__name__)
+
+# ollama.chat()'s response includes these count/duration fields (nanosecond
+# durations from Ollama, converted below) alongside the actual message content --
+# safe to log because they're plain integers describing HOW MUCH was generated, not
+# what. Read with .get() throughout since none of this is guaranteed present for
+# every Ollama version/backend.
+_SAFE_OLLAMA_METADATA_KEYS = ("prompt_eval_count", "eval_count")
+
+
+def _safe_generation_metadata(response: dict) -> dict[str, int]:
+    return {key: response[key] for key in _SAFE_OLLAMA_METADATA_KEYS if key in response}
 
 SYSTEM_PROMPT = """You are an expert cybersecurity threat intelligence analyst.
 
@@ -56,12 +68,15 @@ Respond only with JSON matching the required schema."""
             "LLM invocation failed",
             extra={"event": "llm_invocation", "model": OLLAMA_MODEL, "success": False, "duration_ms": duration_ms},
         )
+        metrics.increment("llm_invocations_total", success="false")
+        metrics.observe_duration_ms("llm_invocation", duration_ms)
         raise LLMUnavailableError(
             f"Could not reach Ollama model '{OLLAMA_MODEL}': {exc}"
         ) from exc
 
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
     content = response["message"]["content"]
+    generation_metadata = _safe_generation_metadata(response)
 
     try:
         fragment = LLMAnalysisFragment.model_validate_json(content)
@@ -73,12 +88,24 @@ Respond only with JSON matching the required schema."""
             content[:500],
             extra={"event": "llm_invocation", "model": OLLAMA_MODEL, "success": False, "duration_ms": duration_ms},
         )
+        metrics.increment("llm_invocations_total", success="false")
+        metrics.observe_duration_ms("llm_invocation", duration_ms)
         raise LLMResponseError(
             "LLM returned a response that did not match the expected schema"
         ) from exc
 
+    # Never logs the prompt or the generated content itself -- only that generation
+    # succeeded, how long it took, and (when Ollama reports them) token counts.
     logger.info(
         "LLM invocation completed",
-        extra={"event": "llm_invocation", "model": OLLAMA_MODEL, "success": True, "duration_ms": duration_ms},
+        extra={
+            "event": "llm_invocation",
+            "model": OLLAMA_MODEL,
+            "success": True,
+            "duration_ms": duration_ms,
+            **generation_metadata,
+        },
     )
+    metrics.increment("llm_invocations_total", success="true")
+    metrics.observe_duration_ms("llm_invocation", duration_ms)
     return fragment

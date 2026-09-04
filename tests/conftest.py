@@ -29,7 +29,12 @@ import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 
 from backend.db.base import Base  # noqa: E402
-from backend.db.models import User  # noqa: E402,F401
+from backend.db.models import (  # noqa: E402,F401
+    AnalysisRecord,
+    ClassificationRecord,
+    Investigation,
+    User,
+)
 from backend.db.session import get_engine, session_scope  # noqa: E402
 from backend.ml.config import FEATURE_COLUMNS  # noqa: E402
 from backend.ml.train import train as train_model  # noqa: E402
@@ -95,6 +100,21 @@ def _reset_users_table():
     yield
     with session_scope() as db:
         db.query(User).delete()
+
+
+@pytest.fixture(autouse=True)
+def _reset_investigations_tables():
+    """Phase 14 added investigations/classification_results/analysis_results.
+    Deleting `Investigation` rows cascades to both children via ON DELETE CASCADE --
+    enforced on SQLite too via the PRAGMA foreign_keys=ON connect listener in
+    backend/db/session.py, without which this cascade would silently do nothing
+    locally while still working on PostgreSQL. Kept as its own reset (not folded into
+    _reset_users_table above) so investigation tests aren't order-coupled to it."""
+    with session_scope() as db:
+        db.query(Investigation).delete()
+    yield
+    with session_scope() as db:
+        db.query(Investigation).delete()
 
 
 @pytest.fixture(autouse=True)

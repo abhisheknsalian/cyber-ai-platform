@@ -5,6 +5,7 @@ from functools import lru_cache
 
 import joblib
 
+from backend import metrics
 from backend.ml.config import FEATURE_COLUMNS, INVERSE_LABEL_MAP, METADATA_PATH, MODEL_PATH
 from backend.ml.preprocessing import features_dict_to_frame
 from backend.ml.schemas import ClassificationResult, FeatureImportanceItem, NetworkTrafficFeatures
@@ -97,16 +98,25 @@ def predict(features: NetworkTrafficFeatures) -> ClassificationResult:
         # always consistent with each other (see tests/test_ml_predictor.py).
         probability = class_probabilities.get(prediction)
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    classification = "malicious" if prediction != "BENIGN" else "benign"
+    version = model_version()
 
+    # Metadata only -- prediction/probability/duration/version, never the input
+    # feature vector (the 78 raw CICFlowMeter measurements `frame` holds above).
     logger.info(
         "Classifier inference completed",
         extra={
             "event": "classifier_inference",
             "prediction": prediction,
+            "classification": classification,
             "probability": probability,
+            "class_probabilities": class_probabilities,
+            "model_version": version,
             "duration_ms": duration_ms,
         },
     )
+    metrics.increment("ml_classifications_total", prediction=prediction)
+    metrics.observe_duration_ms("ml_classification", duration_ms)
 
     return ClassificationResult(
         prediction=prediction,
@@ -115,9 +125,9 @@ def predict(features: NetworkTrafficFeatures) -> ClassificationResult:
         # Generalizes beyond a DDoS-specific check: any non-BENIGN prediction is
         # "malicious". Behaviorally identical to the old `== "DDoS"` check for the
         # current 2-class model, but doesn't need editing if a real class is added.
-        classification="malicious" if prediction != "BENIGN" else "benign",
+        classification=classification,
         class_probabilities=class_probabilities,
-        model_version=model_version(),
+        model_version=version,
     )
 
 

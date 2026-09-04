@@ -1,4 +1,4 @@
-import { RotateCcw } from "lucide-react";
+import { RotateCcw, Save } from "lucide-react";
 
 import { AnalysisResult } from "../components/analysis/AnalysisResult";
 import { ErrorState } from "../components/analysis/ErrorState";
@@ -9,7 +9,9 @@ import type { PipelineStage, StageState } from "../components/common/PipelineSta
 import { PipelineStages } from "../components/common/PipelineStages";
 import { DetectionResultCard } from "../components/detection/DetectionResultCard";
 import { JsonEditor } from "../components/detection/JsonEditor";
+import { useAuth } from "../context/AuthContext";
 import { analyzeClassification, ApiError, classifyTraffic } from "../services/api";
+import { useInvestigationHistoryStore } from "../store/investigationHistoryStore";
 import type { RequestStatus } from "../store/networkDetectionStore";
 import { useNetworkDetectionStore } from "../store/networkDetectionStore";
 import { FEATURE_COLUMNS } from "../types/ml";
@@ -61,11 +63,34 @@ function buildStages(params: {
   return stages;
 }
 
+/** Investigation persistence is session-user-only on the backend (see
+ * backend/security.py::require_user_id) -- demo sessions and unauthenticated
+ * requests are structurally unable to own a row, so "Save" is hidden rather than
+ * shown-then-failing for those cases. */
+function canPersistInvestigations(authenticated: boolean, userId: string | null): boolean {
+  return authenticated && userId !== null && userId !== "demo";
+}
+
+function saveButtonLabel(params: {
+  saveStatus: string;
+  classificationSaved: boolean;
+  hasAnalysis: boolean;
+  analysisSaved: boolean;
+}): string {
+  const { saveStatus, classificationSaved, hasAnalysis, analysisSaved } = params;
+  if (saveStatus === "saving") return "Saving…";
+  if (!classificationSaved) return "Save Investigation";
+  if (hasAnalysis && !analysisSaved) return "Save Analysis";
+  return "Saved";
+}
+
 export function NetworkDetectionPage() {
+  const { authenticated, userId } = useAuth();
   const {
     jsonInput,
     classifyStatus,
     classification,
+    lastClassifiedFeatures,
     classifyError,
     analyzeStatus,
     analysis,
@@ -80,6 +105,15 @@ export function NetworkDetectionPage() {
     analyzeFailure,
     clearInvestigation,
   } = useNetworkDetectionStore();
+  const {
+    saveStatus,
+    saveError,
+    activeClassificationResultId,
+    activeAnalysisSaved,
+    saveCurrent,
+    markNewClassification,
+    resetActiveInvestigation,
+  } = useInvestigationHistoryStore();
 
   // Controls the "Clear Investigation" button -- there's a draft or a result to
   // discard even before a classification has actually run.
@@ -87,6 +121,7 @@ export function NetworkDetectionPage() {
   // Controls the Investigation Timeline -- only shown once an actual classify
   // attempt has happened (success or error), never just because the user is typing.
   const hasRunInvestigation = classifyStatus !== "idle";
+  const canSave = canPersistInvestigations(authenticated, userId);
 
   async function handleClassify() {
     let parsed: NetworkTrafficFeatures;
@@ -98,9 +133,14 @@ export function NetworkDetectionPage() {
     }
 
     startClassify();
+    // A new classification result is unsaved until "Save Investigation" is clicked
+    // again -- but stays part of the SAME investigation (if one is already open) so
+    // re-classifying within a session adds another classification_result to it,
+    // rather than starting a new investigation every time.
+    markNewClassification();
     try {
       const result = await classifyTraffic(parsed);
-      classifySuccess(result);
+      classifySuccess(result, parsed);
     } catch (error) {
       const message = error instanceof ApiError ? error.message : "An unexpected error occurred.";
       classifyFailure(message);
@@ -123,7 +163,29 @@ export function NetworkDetectionPage() {
     }
   }
 
+  async function handleSaveInvestigation() {
+    // Loose nullish check (not `=== null`): a classification result persisted by an
+    // older build of this app (before lastClassifiedFeatures existed in
+    // networkDetectionStore's persisted shape) would restore with this field
+    // `undefined`, not `null` -- both mean "nothing safe to save yet".
+    if (classification === null || lastClassifiedFeatures == null) return;
+    await saveCurrent({
+      features: lastClassifiedFeatures,
+      classification,
+      analysis: analyzeStatus === "success" ? analysis : null,
+      evidence: analyzeStatus === "success" ? evidence : null,
+    });
+  }
+
+  function handleClearInvestigation() {
+    clearInvestigation();
+    resetActiveInvestigation();
+  }
+
   const stages = buildStages({ classifyStatus, classification, analyzeStatus });
+  const hasAnalysis = analyzeStatus === "success" && analysis !== null;
+  const saveDisabled =
+    saveStatus === "saving" || (activeClassificationResultId !== null && (!hasAnalysis || activeAnalysisSaved));
 
   return (
     <div>
@@ -139,11 +201,11 @@ export function NetworkDetectionPage() {
             {hasSomethingToClear ? (
               <button
                 type="button"
-                onClick={clearInvestigation}
+                onClick={handleClearInvestigation}
                 className="flex items-center gap-1.5 rounded border border-border-strong px-2.5 py-1 text-[11px] font-medium text-text-muted transition-colors hover:border-malicious/50 hover:text-malicious-strong"
               >
                 <RotateCcw className="h-3 w-3" strokeWidth={1.75} />
-                Clear Investigation
+                New Investigation
               </button>
             ) : null}
           </div>
@@ -214,6 +276,45 @@ export function NetworkDetectionPage() {
             analyzed={analyzeStatus === "success"}
           />
         )}
+
+        {classifyStatus === "success" && classification ? (
+          <Card className="flex flex-wrap items-center justify-between gap-3 p-4">
+            {canSave && lastClassifiedFeatures != null ? (
+              <>
+                <div className="text-xs text-text-muted">
+                  {saveStatus === "error" && saveError
+                    ? <span className="text-malicious-strong">{saveError}</span>
+                    : activeClassificationResultId !== null
+                      ? "This investigation is saved to your account."
+                      : "Not yet saved -- only visible in this browser until you save it."}
+                </div>
+                <button
+                  type="button"
+                  onClick={handleSaveInvestigation}
+                  disabled={saveDisabled}
+                  className="flex items-center gap-1.5 rounded-md border border-border-strong px-3 py-2 text-xs font-medium text-text-muted transition-colors hover:border-accent/50 hover:text-text disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <Save className="h-3.5 w-3.5" strokeWidth={1.75} />
+                  {saveButtonLabel({
+                    saveStatus,
+                    classificationSaved: activeClassificationResultId !== null,
+                    hasAnalysis,
+                    analysisSaved: activeAnalysisSaved,
+                  })}
+                </button>
+              </>
+            ) : canSave ? (
+              <p className="font-mono text-[11px] text-text-faint">
+                This result was loaded from an older session and can't be saved -- click "Classify Traffic" again to
+                save it.
+              </p>
+            ) : (
+              <p className="font-mono text-[11px] text-text-faint">
+                Sign in with a registered account to save investigations. Demo sessions are not persisted.
+              </p>
+            )}
+          </Card>
+        ) : null}
 
         {analyzeStatus === "loading" && <LoadingState />}
         {analyzeStatus === "error" && analyzeError && <ErrorState message={analyzeError} />}

@@ -4,6 +4,7 @@ import { AppShell } from "./components/layout/AppShell";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import { AboutPage } from "./pages/AboutPage";
 import { DashboardPage } from "./pages/DashboardPage";
+import { InvestigationsPage } from "./pages/InvestigationsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { NetworkDetectionPage } from "./pages/NetworkDetectionPage";
 import { RegisterPage } from "./pages/RegisterPage";
@@ -36,6 +37,7 @@ function AuthGate() {
         <Route path="/" element={<DashboardPage />} />
         <Route path="/analyze" element={<ThreatAnalysisPage />} />
         <Route path="/detection" element={<NetworkDetectionPage />} />
+        <Route path="/investigations" element={<InvestigationsPage />} />
         <Route path="/intelligence" element={<ThreatIntelligencePage />} />
         <Route path="/about" element={<AboutPage />} />
       </Routes>

@@ -1,4 +1,4 @@
-import { Info, LayoutDashboard, Library, LogOut, Radar, Search, ShieldHalf } from "lucide-react";
+import { History, Info, LayoutDashboard, Library, LogOut, Radar, Search, ShieldHalf } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { NavLink } from "react-router-dom";
 
@@ -27,6 +27,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: "/detection", label: "Network Detection", icon: Radar, end: false },
       { to: "/analyze", label: "Threat Analysis", icon: Search, end: false },
+      { to: "/investigations", label: "Investigations", icon: History, end: false },
     ],
   },
   { heading: "Intelligence", items: [{ to: "/intelligence", label: "Threat Intelligence", icon: Library, end: false }] },
