@@ -4,7 +4,7 @@ import { persist } from "zustand/middleware";
 
 import type { ThreatAnalysis } from "../types/api";
 import type { HybridEvidence } from "../types/intelligence";
-import type { ClassificationAnalysisResponse, ClassificationResult } from "../types/ml";
+import type { ClassificationAnalysisResponse, ClassificationResult, NetworkTrafficFeatures } from "../types/ml";
 
 export type RequestStatus = "idle" | "loading" | "success" | "error";
 
@@ -15,6 +15,12 @@ interface PersistedShape {
   jsonInput: string;
   classifyStatus: RequestStatus;
   classification: ClassificationResult | null;
+  /** The exact feature payload POST /classify was called with for `classification`
+   * above -- kept alongside it (not re-derived from `jsonInput`, which the user may
+   * go on editing after a successful classify) so "Save Investigation"
+   * (frontend/src/store/investigationHistoryStore.ts) always persists the features
+   * that actually produced this result, Phase 14. */
+  lastClassifiedFeatures: NetworkTrafficFeatures | null;
   classifyError: string | null;
   analyzeStatus: RequestStatus;
   analysis: ThreatAnalysis | null;
@@ -29,7 +35,7 @@ interface NetworkDetectionState extends PersistedShape {
    * silently lost while the user is mid-edit. */
   setJsonInput: (value: string) => void;
   startClassify: () => void;
-  classifySuccess: (result: ClassificationResult) => void;
+  classifySuccess: (result: ClassificationResult, features: NetworkTrafficFeatures) => void;
   classifyFailure: (message: string) => void;
   startAnalyze: () => void;
   analyzeSuccess: (response: ClassificationAnalysisResponse) => void;
@@ -41,6 +47,7 @@ const INITIAL_PERSISTED_STATE: PersistedShape = {
   jsonInput: "",
   classifyStatus: "idle",
   classification: null,
+  lastClassifiedFeatures: null,
   classifyError: null,
   analyzeStatus: "idle",
   analysis: null,
@@ -133,10 +140,11 @@ export const useNetworkDetectionStore = create<NetworkDetectionState>()(
           analyzeError: null,
         }),
 
-      classifySuccess: (result) =>
+      classifySuccess: (result, features) =>
         set({
           classifyStatus: "success",
           classification: result,
+          lastClassifiedFeatures: features,
           classifyError: null,
           lastUpdated: new Date().toISOString(),
         }),
@@ -145,6 +153,7 @@ export const useNetworkDetectionStore = create<NetworkDetectionState>()(
         set({
           classifyStatus: "error",
           classification: null,
+          lastClassifiedFeatures: null,
           classifyError: message,
         }),
 
@@ -177,6 +186,7 @@ export const useNetworkDetectionStore = create<NetworkDetectionState>()(
         jsonInput: state.jsonInput,
         classifyStatus: state.classifyStatus,
         classification: state.classification,
+        lastClassifiedFeatures: state.lastClassifiedFeatures,
         classifyError: state.classifyError,
         analyzeStatus: state.analyzeStatus,
         analysis: state.analysis,

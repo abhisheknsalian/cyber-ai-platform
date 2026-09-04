@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import time
 
+from backend import metrics
 from backend.intelligence.entities import threat_id
 from backend.intelligence.graph_store import get_graph
 from backend.intelligence.normalizer import slug_for
@@ -21,7 +22,7 @@ from backend.intelligence.schemas import (
     ThreatGraphNeighborhood,
     VectorEvidenceItem,
 )
-from backend.rag.config import RAG_SCORE_THRESHOLD, RAG_TOP_K
+from backend.rag.config import COLLECTION_NAME, RAG_SCORE_THRESHOLD, RAG_TOP_K
 from backend.rag.retrieval import retrieve_relevant
 
 logger = logging.getLogger("backend.intelligence")
@@ -110,23 +111,48 @@ def gather_hybrid_evidence(
         for doc, score in relevant
     ]
 
+    # Metadata only -- counts, timing, and the resolved primary threat, never the
+    # retrieved chunk text itself (that's the knowledge base's actual intelligence
+    # content, already served in the response; this log is a metric, not a copy).
+    logger.info(
+        "RAG retrieval completed",
+        extra={
+            "event": "rag_retrieval_completed",
+            "collection": COLLECTION_NAME,
+            "top_k": RAG_TOP_K,
+            "retrieved_count": len(vector_evidence),
+            "duration_ms": vector_duration_ms,
+            "success": True,
+        },
+    )
+    metrics.increment("rag_retrievals_total")
+    metrics.observe_duration_ms("rag_retrieval", vector_duration_ms)
+
     primary_threat = threat_hint or (relevant[0][0].metadata.get("threat_type") if relevant else None)
 
     graph_start = time.perf_counter()
     graph_evidence = graph_evidence_for_threat(slug_for(primary_threat)) if primary_threat else []
     graph_duration_ms = round((time.perf_counter() - graph_start) * 1000, 2)
+    # Distinct target entities referenced by this threat's relationships, plus the
+    # threat entity itself when one was resolved -- how much of the graph this
+    # particular request actually touched, not the graph's total size (see
+    # backend/intelligence/graph_store.py's separate, one-time "graph_built" event
+    # for that).
+    entity_count = len({item.target_id for item in graph_evidence}) + (1 if primary_threat else 0)
 
     logger.info(
-        "Hybrid retrieval completed",
+        "Threat graph retrieval completed",
         extra={
-            "event": "hybrid_retrieval",
+            "event": "graph_retrieval_completed",
             "primary_threat": primary_threat,
-            "vector_count": len(vector_evidence),
-            "graph_relation_count": len(graph_evidence),
-            "vector_duration_ms": vector_duration_ms,
-            "graph_duration_ms": graph_duration_ms,
+            "entity_count": entity_count,
+            "relationship_count": len(graph_evidence),
+            "duration_ms": graph_duration_ms,
+            "success": True,
         },
     )
+    metrics.increment("graph_retrievals_total")
+    metrics.observe_duration_ms("graph_retrieval", graph_duration_ms)
 
     return HybridEvidence(
         query=query,

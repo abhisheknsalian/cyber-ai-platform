@@ -1,5 +1,15 @@
 import type { AnalyzeRequest, HealthResponse, ReadinessResponse, ThreatAnalysis, ThreatCategory } from "../types/api";
 import type { AuthStatusResponse, LoginRequest, RegisterRequest, UserPublic } from "../types/auth";
+import type {
+  AnalysisResultCreateRequest,
+  ClassificationResultCreateRequest,
+  InvestigationCreateRequest,
+  InvestigationCreateResponse,
+  InvestigationDetail,
+  InvestigationListResponse,
+  StoredAnalysisResult,
+  StoredClassificationResult,
+} from "../types/investigations";
 import type { ThreatGraphNeighborhood } from "../types/intelligence";
 import type {
   ClassificationAnalysisRequest,
@@ -26,6 +36,13 @@ const REQUEST_TIMEOUT_MS = 60_000;
 const CSRF_COOKIE_NAME = "cyber_ai_csrf";
 const CSRF_HEADER_NAME = "X-CSRF-Token";
 
+// Must match backend/middleware.py::REQUEST_ID_HEADER. Readable cross-origin only
+// because backend/main.py's CORSMiddleware sets expose_headers=[REQUEST_ID_HEADER]
+// (a browser hides all but a small CORS-safelisted set of response headers from JS
+// by default) -- this is the fallback path for a response whose body isn't
+// JSON-parseable; the primary path reads `request_id` from the parsed body below.
+const REQUEST_ID_HEADER = "X-Request-ID";
+
 /** Dispatched whenever any request comes back 401, except /auth/login itself (a
  * failed login attempt isn't "your session expired"). AuthContext listens for this
  * to drop the app back to the login page instead of leaving pages stuck on a
@@ -35,11 +52,17 @@ export const UNAUTHORIZED_EVENT = "cyber-ai:unauthorized";
 /** Thrown for every failure mode: network-down, timeout, non-2xx, and malformed responses. */
 export class ApiError extends Error {
   readonly status: number | null;
+  /** backend/main.py's error envelope's `request_id` (or the X-Request-ID response
+   * header as a fallback) -- a safe, non-sensitive identifier the user can quote
+   * when reporting an issue, without exposing any server internals. null for
+   * client-side failures (network down, timeout) that never reached the backend. */
+  readonly requestId: string | null;
 
-  constructor(message: string, status: number | null = null) {
+  constructor(message: string, status: number | null = null, requestId: string | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.requestId = requestId;
   }
 }
 
@@ -90,8 +113,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
 
     let detail = `Request failed with status ${response.status}.`;
+    // Fallback for a non-JSON body (e.g. a proxy's own error page) -- the primary
+    // source is body.request_id below, read from backend/main.py's error envelope.
+    let requestId = response.headers.get(REQUEST_ID_HEADER);
     try {
       const body = await response.json();
+      if (typeof body?.request_id === "string") {
+        requestId = body.request_id;
+      }
       if (typeof body?.detail === "string") {
         detail = body.detail;
       } else if (Array.isArray(body?.detail)) {
@@ -110,7 +139,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Response body wasn't JSON -- keep the generic message above.
     }
-    throw new ApiError(detail, response.status);
+    // Only for server errors: a 4xx already has a specific, actionable message
+    // (bad input, not found, etc.) that doesn't need a support reference attached.
+    if (response.status >= 500 && requestId) {
+      detail = `${detail} Reference ID: ${requestId}`;
+    }
+    throw new ApiError(detail, response.status, requestId);
   }
 
   try {
@@ -177,6 +211,45 @@ export function analyzeClassification(
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+// --- Persistent investigations (Phase 14) -------------------------------------
+// Session-user-only on the backend (backend/security.py::require_user_id) -- these
+// calls use the same credentials: "include" + CSRF-header handling as every other
+// state-changing request in this file (see request() above); pages never need to
+// touch cookies or headers directly.
+
+export function createInvestigation(payload: InvestigationCreateRequest): Promise<InvestigationCreateResponse> {
+  return request<InvestigationCreateResponse>("/investigations", { method: "POST", body: JSON.stringify(payload) });
+}
+
+export function listInvestigations(limit = 20, offset = 0): Promise<InvestigationListResponse> {
+  return request<InvestigationListResponse>(`/investigations?limit=${limit}&offset=${offset}`);
+}
+
+export function getInvestigation(investigationId: number): Promise<InvestigationDetail> {
+  return request<InvestigationDetail>(`/investigations/${investigationId}`);
+}
+
+export function saveClassificationResult(
+  investigationId: number,
+  payload: ClassificationResultCreateRequest,
+): Promise<StoredClassificationResult> {
+  return request<StoredClassificationResult>(`/investigations/${investigationId}/classification-results`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function saveAnalysisResult(
+  investigationId: number,
+  resultId: number,
+  payload: AnalysisResultCreateRequest,
+): Promise<StoredAnalysisResult> {
+  return request<StoredAnalysisResult>(
+    `/investigations/${investigationId}/classification-results/${resultId}/analysis-result`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
 }
 
 /** Public endpoint (Phase 9) -- no auth/CSRF required, same as getThreats(). */

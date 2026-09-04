@@ -127,16 +127,33 @@ def run_pipeline_benchmark(*, sample_size: int = _PIPELINE_SAMPLE_SIZE) -> Pipel
         classify_and_analyze(request)
         total_latencies.append((time.perf_counter() - total_start) * 1000)
 
+    stages = [
+        PipelineStageLatency(stage="classifier_inference", latency=latency_stats(classifier_latencies)),
+        PipelineStageLatency(stage="vector_retrieval", latency=latency_stats(vector_latencies)),
+        PipelineStageLatency(stage="graph_retrieval", latency=latency_stats(graph_latencies)),
+        PipelineStageLatency(stage="hybrid_retrieval", latency=latency_stats(hybrid_latencies)),
+        PipelineStageLatency(stage="llm_analysis", latency=latency_stats(llm_latencies)),
+        PipelineStageLatency(stage="total_classify_and_analyze", latency=latency_stats(total_latencies)),
+    ]
+
+    # Phase 16, Part H: each stage's share of end-to-end latency. Divides by
+    # "total_classify_and_analyze"'s own mean (one true, unmodified pipeline call --
+    # see note below) -- shares will not sum to exactly 100% for the same reason the
+    # stage means don't sum to the total mean: the isolated per-stage calls are a
+    # second round of calls on top of what classify_and_analyze() itself does
+    # internally (e.g. gather_hybrid_evidence's own extra vector search), not
+    # sub-timings sliced out of one run.
+    total_mean = next((s.latency.mean_ms for s in stages if s.stage == "total_classify_and_analyze"), None)
+    stage_latency_share_pct = (
+        {s.stage: round(s.latency.mean_ms / total_mean * 100, 2) for s in stages if total_mean}
+        if total_mean
+        else None
+    )
+
     return PipelineBenchmark(
         queries_evaluated=len(features_samples),
-        stages=[
-            PipelineStageLatency(stage="classifier_inference", latency=latency_stats(classifier_latencies)),
-            PipelineStageLatency(stage="vector_retrieval", latency=latency_stats(vector_latencies)),
-            PipelineStageLatency(stage="graph_retrieval", latency=latency_stats(graph_latencies)),
-            PipelineStageLatency(stage="hybrid_retrieval", latency=latency_stats(hybrid_latencies)),
-            PipelineStageLatency(stage="llm_analysis", latency=latency_stats(llm_latencies)),
-            PipelineStageLatency(stage="total_classify_and_analyze", latency=latency_stats(total_latencies)),
-        ],
+        stages=stages,
+        stage_latency_share_pct=stage_latency_share_pct,
         note=(
             "Real DDoS rows from the local dataset, run through the unmodified "
             "classify_and_analyze() / analyze_query() path; requires a reachable "

@@ -258,6 +258,7 @@ accumulates stale or duplicate chunks.
 - `GET /` — basic liveness message (public)
 - `GET /health` — process/application health (does not run LLM inference — see below) (public)
 - `GET /ready` — readiness: whether RAG/classifier/LLM dependencies are actually available (Phase 8; see **Observability & Operations** > "Health vs Readiness") (public)
+- `GET /metrics` — Prometheus-text-format counters/durations for HTTP requests and every pipeline stage (Phase 15; see **Observability & Operations** > "Metrics") (public)
 - `GET /threats` — threat categories discovered from `data/threat_intel/*.txt`, for the frontend (public)
 - `POST /analyze` — structured, retrieval-grounded threat analysis (protected, rate-limited)
 - `POST /classify` — DDoS/BENIGN network-traffic classification (Random Forest); see **ML Detection Pipeline** (protected, rate-limited)
@@ -269,6 +270,8 @@ accumulates stale or duplicate chunks.
 - `GET /docs` — interactive Swagger UI (public)
 - `POST /auth/register` — create a new persistent user account (Phase 13; see **Authentication** and **Database Architecture** below) (public, rate-limited)
 - `POST /auth/login`, `POST /auth/logout`, `GET /auth/me` — see **Authentication** below (login is rate-limited; all three are public — session/API-key auth is what they exist to provide, not what protects them)
+- `POST /investigations`, `GET /investigations`, `GET /investigations/{id}` — create/list/view persistent per-user investigations (Phase 14; see **Database Architecture** > "User-specific investigations") (session-user-only, never API-key or demo)
+- `POST /investigations/{id}/classification-results`, `POST /investigations/{id}/classification-results/{id}/analysis-result` — persist an already-computed `/classify`/`/analyze/classification` result into an investigation; never re-run inference (Phase 14) (session-user-only)
 
 `GET /health` response (unchanged since Phase 6):
 
@@ -954,31 +957,36 @@ uv run alembic upgrade head
 # `alembic upgrade head` before uvicorn — idempotent, a no-op once the schema is current)
 ```
 
-### User-specific investigations (foundation, not yet built)
+### User-specific investigations (Phase 14 — implemented)
 
-The Network Detection page's investigation state
-(`frontend/src/store/networkDetectionStore.ts`, persisted client-side under the
-`cyber-ai-network-detection-v1` `localStorage` key) is **unchanged by this phase** — it still
-works exactly as before, for both anonymous and now-authenticated users. Phase 13 only builds the
-identity foundation a future phase would need to make that state per-user and server-persisted:
+Registered users can save a Network Detection classification (and its AI analysis, if run) to
+PostgreSQL/SQLite and revisit it later:
 
 ```text
 users
-  ↓ (1-to-many, FK user_id)
+  ↓ (1-to-many, FK user_id, ON DELETE CASCADE)
 investigations            -- one row per Network Detection session: created_at, label
-  ↓ (1-to-many, FK investigation_id)
-classification_results    -- one row per POST /classify call: features (jsonb), prediction, confidence
-  ↓ (1-to-one, FK classification_result_id)
+  ↓ (1-to-many, FK investigation_id, ON DELETE CASCADE)
+classification_results    -- one row per persisted POST /classify result: features (JSON), prediction, confidence
+  ↓ (1-to-0..1, FK classification_result_id UNIQUE, ON DELETE CASCADE)
 analysis_results           -- the POST /analyze/classification output for that result, if run
 ```
 
-That schema is deliberately **not implemented yet** — this phase's job was the user/database
-foundation, not moving `localStorage` state to the server (a genuinely separate, larger change:
-new endpoints, a migration, and a frontend rewrite of `networkDetectionStore.ts` from a local
-Zustand-persisted store to server-fetched state). Building it later is a clean, additive Alembic
-migration on top of the `users` table already in place, with each new table's `user_id` resolved
-from the authenticated session (`backend/sessions.py::session_identity()`) the same way
-`require_auth()` already does for every protected endpoint.
+`backend/db/models.py` (ORM), `backend/investigations/schemas.py` (request/response), and
+`backend/services/investigations.py` (ownership-scoped persistence — every read/write is scoped to
+the owning `user_id` directly in the query, never fetched then compared) implement this on top of
+the `users` table Phase 13 introduced. New endpoints: `POST/GET /investigations`, `GET
+/investigations/{id}`, `POST /investigations/{id}/classification-results`, `POST
+/investigations/{id}/classification-results/{id}/analysis-result` — all session-user-only (see
+**Authentication**'s `require_user_id()`), never available to API-key callers or the demo session.
+Frontend: a "Save Investigation" control on Network Detection
+(`frontend/src/pages/NetworkDetectionPage.tsx`) and a dedicated `/investigations` history page
+(`frontend/src/pages/InvestigationsPage.tsx`), backed by a new
+`frontend/src/store/investigationHistoryStore.ts` Zustand store kept deliberately separate from
+`networkDetectionStore.ts` (draft/current-result UI state) — server-fetched history is a different
+kind of state than an in-progress, unsaved edit. `networkDetectionStore.ts`'s own `localStorage`
+persistence (`cyber-ai-network-detection-v1`) is unchanged and still the only state a demo session
+or an unsaved draft ever has.
 
 ## Authentication
 
@@ -1103,10 +1111,16 @@ in-flight request after re-login; the user re-submits it.
 ## Observability & Operations
 
 Phase 8 hardens the backend operationally: structured logs, request correlation, a
-readiness/health split, security headers, and lightweight rate limiting. None of this changes the
-RAG pipeline, the classifier, authentication behavior, or any existing API response shape —
-everything below is additive. This is **production-hardened, local-first** tooling, not a claim
-that the system is "production ready" in the sense of a multi-tenant, horizontally-scaled,
+readiness/health split, security headers, and lightweight rate limiting. Phase 15 builds on that
+same foundation — **no second logging framework, request-ID system, or middleware was added** —
+to make the full investigation pipeline (Network Detection → classifier → RAG → threat graph → LLM
+→ analysis → persisted investigation, Phase 13/14) measurable end-to-end: per-stage timing events
+for the pieces Phase 8 didn't yet instrument (investigation persistence, and a split
+RAG-vs-graph view of retrieval), a `user_id` on every authenticated request's log line, a
+`GET /metrics` endpoint, and a `logout` audit event alongside the existing login ones. None of this
+changes the RAG pipeline, the classifier, authentication behavior, or any existing API response
+shape — everything below is additive. This is **production-hardened, local-first** tooling, not a
+claim that the system is "production ready" in the sense of a multi-tenant, horizontally-scaled,
 internet-facing deployment — see "Known limitations" at the end of this section for exactly why.
 
 ### Structured logging
@@ -1117,20 +1131,72 @@ Every log line is a single JSON object (`backend/logging_config.py`) with `times
 event). Replaces the earlier `logging.basicConfig(...)` default format entirely; nothing else about
 how modules obtain a logger (`logging.getLogger(__name__)`) changed.
 
-Logged events include: application startup/shutdown, every request received/completed (with
-method, path, status code, duration), authentication success/failure, login success/failure,
-rate-limit rejections, RAG retrieval (duration, retrieved-chunk count, selected threat type —
-**never the query text itself**, only its length), classifier inference (prediction, probability,
-duration — **never the input feature vector**), and LLM invocation (model, success/failure,
-duration — **never the prompt or the full response**; a validation failure logs at most a 500-
-character excerpt for debugging, unchanged from Phase 2).
+Logged events include: application startup/shutdown, every request received/completed (method,
+path, status code, duration, and — Phase 15 — the authenticated `user_id`/`auth_method` when the
+request went through `require_auth()`/`require_user_id()`, omitted entirely for public/anonymous
+requests rather than logged as null), authentication success/failure, login success/failure,
+**logout** (Phase 15, with `user_id`), rate-limit rejections, classifier inference (prediction,
+class probabilities, model version, duration — **never the input feature vector**), RAG retrieval
+and threat-graph retrieval as two distinct events (Phase 15 — see "Pipeline instrumentation"
+below), LLM invocation (model, success/failure, duration, and — when Ollama reports them — prompt/
+completion token counts — **never the prompt or the full response**; a validation failure logs at
+most a 500-character excerpt of the malformed output for debugging, unchanged from Phase 2), and
+investigation persistence (Phase 15 — created/loaded/classification-persisted/analysis-persisted,
+plus a `investigation_access_denied` audit event when a request resolves to someone else's
+investigation or a nonexistent one).
 
 **Never logged, anywhere:** the API key, the configured username/password, session tokens, CSRF
-tokens, the raw `Authorization` header, or full request bodies containing any of the above. This is
-enforced by convention and verified by tests (`tests/test_session_auth.py`'s pre-existing
-`test_credentials_never_appear_in_logs`/`test_session_token_never_appears_in_logs`, plus
-`tests/test_error_handling.py`'s new secret-leakage checks) — login logs only *whether* an attempt
+tokens, the raw `Authorization` header, full request/response bodies, the 78-feature network
+payload, stored investigation feature vectors, or AI-generated report content (summary, sources,
+evidence). This is enforced by convention and verified by tests (`tests/test_session_auth.py`'s
+pre-existing `test_credentials_never_appear_in_logs`/`test_session_token_never_appears_in_logs`,
+`tests/test_error_handling.py`'s secret-leakage checks, and Phase 15's
+`tests/test_observability.py`, which additionally proves — structurally, by checking every
+request-log record's fields against a closed allow-list, not by string-searching — that headers/
+cookies/bodies can never reach the HTTP access-log events) — login logs only *whether* an attempt
 succeeded, never the attempted username or password.
+
+### Pipeline instrumentation (Phase 15)
+
+The investigation pipeline this project is actually built around —
+`POST /classify` → `POST /analyze/classification` (RAG + threat graph + LLM) → `POST
+/investigations/.../classification-results` + `.../analysis-result` (Phase 14 persistence) — now
+has an independently-timed, independently-named log event at every stage, so total request latency
+and per-stage latency can always be told apart:
+
+| Stage | Event | Key fields (never the content itself) |
+|---|---|---|
+| ML classification | `classifier_inference` (`backend/ml/predictor.py`) | `prediction`, `classification`, `probability`, `class_probabilities`, `model_version`, `duration_ms` |
+| RAG retrieval | `rag_retrieval_completed` (`backend/intelligence/hybrid_retrieval.py`) | `collection`, `top_k`, `retrieved_count`, `duration_ms`, `success` |
+| Threat graph retrieval | `graph_retrieval_completed` (`backend/intelligence/hybrid_retrieval.py`) | `primary_threat`, `entity_count`, `relationship_count`, `duration_ms`, `success` |
+| LLM invocation | `llm_invocation` (`backend/services/llm.py`) | `model`, `success`, `duration_ms`, `prompt_eval_count`/`eval_count` when Ollama reports them |
+| Investigation persistence | `investigation_created` / `classification_result_persisted` / `analysis_result_persisted` / `investigation_loaded` (`backend/services/investigations.py`) | `user_id`, `investigation_id`, `classification_result_id`, `duration_ms`, `success` |
+
+`POST /analyze` (the plain query-only endpoint, no classifier involved) uses its own, separate,
+pre-existing Phase 9 retrieval instrumentation in `backend/services/threat_analysis.py`
+(`rag_retrieval` / `rag_threat_selected` events) — untouched by Phase 15, since that code path
+doesn't feed the classify → analyze → persist pipeline the table above documents. The
+`graph_retrieval_completed` event's `entity_count`/`relationship_count` describe only what *this
+request* touched (the resolved threat's direct relationships) — for the threat graph's total size,
+see the separate, one-time `graph_built` event logged when the graph is first loaded into memory
+(`backend/intelligence/graph_store.py`, unchanged since Phase 9).
+
+Because every one of these events is emitted while `backend/logging_config.py`'s request-ID
+contextvar is set, and `backend/middleware.py`'s `request_completed` line is enriched with
+`user_id`, a single `request_id` (or, across the classify → save → analyze → save round trip a
+real user performs, a shared `investigation_id`) is enough to reconstruct exactly what happened at
+every stage of one request or one investigation, in order, from the JSON logs alone.
+
+### User identity in logs
+
+`backend/security.py`'s `require_auth()` and `require_user_id()` dependencies record the resolved
+identity on `request.state` (`user_id`, `auth_method`) on their success path only — this is pure
+logging enrichment, read only by `backend/middleware.py`'s access-log line, and changes nothing
+about what is or isn't accepted as a credential. An API-key request gets `auth_method: "api_key"`
+and no `user_id` (a bare key has no associated `users` row to attach); a session request gets
+`auth_method: "session"` and the session's `user_id` (`"demo"` for the bootstrap/demo login,
+otherwise the real `users.id`). Public/unauthenticated requests carry neither field, so a `GET
+/health` log line looks exactly as it did before this existed.
 
 ### Request IDs
 
@@ -1144,6 +1210,24 @@ request object threaded through it), returned in the `X-Request-ID` response hea
 in every error response body alongside `detail`. **It is never treated as a credential** — `
 require_auth()` never reads it, and a syntactically perfect request ID does not grant access to
 anything.
+
+`backend/main.py`'s `CORSMiddleware` sets `expose_headers=["X-Request-ID"]` (Phase 15) —
+without it, a browser hides all but a small CORS-safelisted set of response headers from JS on a
+cross-origin response, and the frontend and backend are always different origins in this
+architecture (`:8080` vs `:8000`), so `frontend/src/services/api.ts` could never actually read this
+header before this was added. The frontend's primary source for the ID is the JSON error body's
+`request_id` field (unaffected by CORS either way); the header is the fallback for a response whose
+body isn't JSON-parseable at all.
+
+**Why `GET /health`/`GET /ready` access-log lines aren't suppressed.** They're polled on an
+interval by the frontend's sidebar status indicator (`useHealth`/`useReadiness`), not user-initiated
+and not part of the investigation pipeline — a busier deployment might reasonably drop them to
+`DEBUG` to cut noise. This project deliberately doesn't: `tests/test_request_id.py`'s existing
+`test_request_id_appears_in_logs` already asserts that *every* request — specifically `GET
+/health`, the simplest possible case — produces a request-correlated log line, and at this
+project's actual traffic volume (a local/demo deployment) the noise is negligible. Revisit if real
+production log volume ever makes the tradeoff worth it (see `backend/middleware.py` for exactly
+where such a change would go).
 
 ### Health vs Readiness
 
@@ -1232,7 +1316,58 @@ exception's full traceback is always logged server-side (with the request ID) an
 in the HTTP response — the client only ever sees `{"detail": "An unexpected error occurred.",
 "request_id": "..."}`. No filesystem path, Python traceback, environment variable, or secret value
 has ever been observed in a response body in this codebase's error paths (verified in
-`tests/test_error_handling.py`).
+`tests/test_error_handling.py`). The frontend surfaces this `request_id` directly: any server error
+(`status >= 500`) has it appended to the displayed message as `Reference ID: abc123`
+(`frontend/src/services/api.ts::ApiError`) — a safe identifier the user can quote when reporting an
+issue, without any page needing its own error-handling code (every existing page already renders
+`ApiError.message`, so this changed nothing about how pages consume errors).
+
+### Metrics (Phase 15)
+
+`GET /metrics` exposes a small set of in-process counters/durations in Prometheus text exposition
+format (`backend/metrics.py`) — HTTP request counts and latency by method/path/status, plus
+counts and latency for each pipeline stage in the table above (`ml_classifications_total`,
+`rag_retrievals_total`, `graph_retrievals_total`, `llm_invocations_total`,
+`investigation_persistence_total`, and a `_duration_ms` summary — `_count`/`_sum` pair — for each).
+Public, like `GET /health`; only aggregate counters are exposed, never request-scoped or secret
+data.
+
+**Deliberately not** `prometheus_client`, and **deliberately not** an actual running
+Prometheus/Grafana/Loki/ELK stack. `backend/metrics.py` is under 100 lines of stdlib Python (a
+`dict` + a `threading.Lock`) — genuinely scrapeable by a real Prometheus if one is ever pointed at
+this service, without adding a dependency or a second piece of infrastructure to a single-process
+local/demo deployment. A real production deployment of this project would put a real Prometheus
+(scraping this endpoint) and Grafana (dashboards) in front of it; that infrastructure isn't
+justified for this project's current scope and isn't included here — this endpoint is the
+integration point where it would attach.
+
+### Audit events: why structured logs, not a new database table
+
+Phase 15 asked for a lightweight security/audit mechanism given the project is now multi-user. The
+events above (`login_success`/`login_failure`/`logout`/`register_success`/`investigation_created`/
+`classification_result_persisted`/`analysis_result_persisted`/`investigation_access_denied`) *are*
+that mechanism — structured, `request_id`- and `user_id`-correlated JSON log lines, queryable with
+any log tool. A **persistent, database-backed** audit table was deliberately not built, even though
+Phase 14 already added exactly the kind of clean database abstraction (`backend/db/`,
+`session_scope()`) that would make one easy to bolt on. The reasons:
+
+- It's genuine new scope: a new table, a migration, a retention/rotation policy, and — to be worth
+  the extra database writes on every login/persistence call — a reason to query audit history
+  independently of the log stream, which nothing in this project currently needs.
+- It duplicates data that already exists in the structured logs, without duplicating any capability
+  the logs don't already have at this project's scale (a local/demo deployment, not a
+  compliance-driven multi-tenant system with a log-retention SLA a database table would exist to
+  satisfy).
+- Every log-based event already carries `request_id` and (where applicable) `user_id`, so it's
+  already queryable/correlatable exactly like a database-backed audit table would be, via
+  `grep`/`jq` over the JSON log stream instead of SQL.
+
+If a real requirement emerges later — e.g. an in-app "recent account activity" view, or a
+compliance retention requirement the log stream can't satisfy — the natural next step is a small
+`audit_events` table (`user_id`, `event`, `metadata` JSON, `created_at`), written from the same
+call sites already listed above, following the exact Alembic-migration pattern Phase 14 already
+established. Not built now because nothing in this project currently demonstrates a need for it —
+consistent with this README's running theme of not building ahead of a demonstrated requirement.
 
 ## Docker Backend
 
@@ -2203,9 +2338,10 @@ threat graph. It only loads and measures what already exists, against the real l
 CSV and the real trained model artifact (not the tests' synthetic fixture).
 
 ```bash
-uv run python -m backend.evaluation                 # offline: ML + retrieval evaluation, no Ollama needed
+uv run python -m backend.evaluation                 # offline: ML + retrieval + relevance + hybrid ablation, no Ollama needed
 uv run python -m backend.evaluation --pipeline       # also runs the end-to-end pipeline benchmark (needs Ollama)
-uv run python -m backend.evaluation --output path.json
+uv run python -m backend.evaluation --llm            # also runs LLM evaluation + grounding (needs Ollama)
+uv run python -m backend.evaluation --pipeline --llm --output path.json
 ```
 
 Requires the same local artifacts the rest of the README does: the real dataset at
@@ -2234,7 +2370,17 @@ below is explained in detail further down this section.
 | | Vector retrieval | `~5–45ms` | |
 | | Graph retrieval | `<1ms` | |
 | | Hybrid retrieval | `~4–6ms` | |
-| | LLM analysis | `~2.6–2.7s` | The dominant cost by roughly two orders of magnitude — see **Performance** under **Threat Intelligence Graph** |
+| | LLM analysis | `~2.66s` | `100.22%` of the `total_classify_and_analyze` mean — see "Per-stage latency share" below |
+| | `total_classify_and_analyze` (end-to-end) | `~2.66s` | Real end-to-end call, not a sum of the isolated stages above — see `pipeline.note` |
+| Retrieval relevance (15 queries, 5 categories, k=[3,5,10]) | Recall@3 / Precision@3 | `0.9333` / `0.8667` | Ground truth = each chunk's real `threat_type` ingestion metadata, not invented judgments — see "Retrieval relevance is now measured, not just coverage" below |
+| | Recall@10 / Precision@10 | `1.0` / `0.28` | Precision falls as *k* grows past the ~3 relevant chunks per category — expected, not a bug |
+| | Hit Rate@3/5/10, MRR@3/5/10 | `1.0` | The first hit is always the top-ranked result for every one of these 15 queries |
+| Hybrid ablation (15 queries) | `relevance_delta` (hybrid − vector-only) | `0.0` at every *k* | Hybrid never re-ranks or filters vector results in this architecture — see "Hybrid ablation: the honest null result" below |
+| | `evidence_coverage_rate` | `1.0` | Every query's resolved category had graph evidence to add |
+| | `mean_latency_overhead_ms` | `~-0.02` to `-0.05` | Not a real speedup — see the negative-latency note below |
+| LLM evaluation — automated (7 cases) | `schema_valid_rate`, on/off-topic correctness, `non_empty_attack_vectors_rate`, `severity_present_rate` | `1.0` | Structural checks only — see "LLM evaluation: automated vs. human rubric" below |
+| LLM evaluation — human rubric (3 dimensions) | mean score | **NOT YET MEASURED** | Requires human annotation of `evaluation/llm_rubric_template.csv` — never fabricated |
+| Grounding (lexical-overlap proxy, 5 cases) | `mean_supported_ratio` | `1.0` | Coarse proxy on `attack_vectors` phrases only, not a hallucination rate — see "Grounding is a proxy, not hallucination detection" below |
 
 These numbers describe **this local dataset and this local model**, not general-purpose DDoS
 detection performance — see "Why 99.99% accuracy is not a general DDoS-detection claim" below.
@@ -2290,6 +2436,87 @@ behavior), so they will not sum exactly to the end-to-end total; see the report'
 field for the precise accounting. A single discarded warm-up LLM call runs before timing starts, so
 Ollama's one-time model-load cost doesn't skew the first sample's latency.
 
+**Per-stage latency share.** `pipeline.stage_latency_share_pct` expresses each stage's mean
+latency as a percentage of `total_classify_and_analyze`'s mean, computed *after* measuring, not
+assumed beforehand — the instruction driving this experiment was explicitly "do not assume the LLM
+is the bottleneck before measuring." In this environment it is: `llm_analysis` alone accounts for
+essentially the entire end-to-end latency (`~100%`, with the isolated-stage sum exceeding 100%
+because these are separate calls to the same functions the pipeline calls, not sub-measurements of
+one call — see `pipeline.note`), while classifier inference, vector retrieval, graph retrieval, and
+hybrid retrieval are each under 1% of the total, all completing in single-digit milliseconds.
+
+**Retrieval relevance is now measured, not just coverage.** `retrieval_relevance.py` (Part B) adds a
+second, independent retrieval evaluation alongside the six-query coverage sanity check above: 15
+queries (3 per threat category — botnet, DDoS, phishing, ransomware, SQL injection), each scored
+against **real ground truth** — every chunk's actual `threat_type` ingestion metadata
+(`backend/rag/ingestion.py`'s `doc.metadata["threat_type"]`), not a hand-picked or invented relevance
+judgment. It reports Recall@k, Precision@k, Hit Rate@k, and MRR@k at k=3, 5, and 10. Recall and hit
+rate reach 1.0 by k=10 (every relevant chunk for a category is eventually retrieved), while precision
+falls as k grows past the roughly 2–3 truly relevant chunks per category in this 14-chunk corpus —
+an expected artifact of a small corpus with few relevant items per topic, not a retrieval defect.
+This evaluation deliberately bypasses `RAG_SCORE_THRESHOLD` (via a direct
+`similarity_search_with_score()` call) so the metrics measure the retriever's raw ranking ability,
+independent of the production relevance filter.
+
+**Hybrid ablation: the honest null result.** Part C/D asked whether hybrid (vector + graph) evidence
+improves retrieval relevance over vector-only, explicitly required to be capable of showing
+improvement, no difference, or degradation — not assumed to be "yes." Reading
+`backend/intelligence/hybrid_retrieval.py` shows why the answer is a clean null: hybrid retrieval in
+this architecture only *adds* graph evidence alongside the unchanged vector results — it never
+re-ranks or filters them. `hybrid_ablation.py` therefore reuses the exact same ranked vector list for
+both conditions and reports `relevance_delta` as an exact, verified `0.0` at every k, rather than a
+near-zero number that could be mistaken for noise. Hybrid's real, measurable contribution is
+elsewhere: `evidence_coverage_rate` (`1.0` — every one of the 15 queries' resolved threat category had
+graph evidence to add) and the `mean_graph_entity_count`/`mean_graph_relationship_count` per query
+(see the JSON report). `mean_latency_overhead_ms` measures slightly negative in this environment
+(hybrid appearing marginally faster than vector-only) — this is not a genuine speed advantage; both
+stages complete in single-digit milliseconds, well within the range of process/cache jitter (e.g. a
+warm embedding/Chroma cache from call ordering within the loop), so it is reported and explained as
+measurement noise, not hidden or "corrected." A graph-only ranking condition was not built: graph
+lookup in this codebase requires an already-resolved threat category, not a bare query, so a
+graph-only *document-ranking* experiment isn't architecturally meaningful here — consistent with "do
+not build new graph functionality merely to enable the experiment."
+
+**LLM evaluation: automated vs. human rubric.** Part E scopes evaluation to only the fields the LLM
+genuinely authors — `severity`, `summary`, `attack_vectors`, and the `insufficient_context` relevance
+decision. `threat`, `mitre_attack`, `indicators`, and `mitigations` are deterministically derived from
+source documents and the threat graph (see **Threat Intelligence Graph**), not LLM-generated, and are
+correctly excluded from an "LLM quality" score. Two tiers are reported, deliberately kept separate:
+- **Automated** (structural, requires no human judgment): `schema_valid_rate`, whether an on-topic
+  query correctly produced a non-`insufficient_context` result and an off-topic query correctly
+  produced `insufficient_context` (both `1.0` on 7 cases — 5 categories + 2 negative controls),
+  `non_empty_attack_vectors_rate`, `severity_present_rate`.
+- **Human rubric** (quality judgment, 0/1/2 scale — 0 = incorrect, 1 = partially correct, 2 =
+  correct): `severity_reasonableness`, `summary_grounding_quality`, `attack_vectors_relevance`.
+  `run_llm_evaluation()` writes a ready-to-fill CSV (`evaluation/llm_rubric_template.csv`, one row per
+  case with the real query/category/severity/summary/attack_vectors already populated and three blank
+  score columns) but never invents scores — every dimension's `status` is reported as
+  `"not_yet_annotated"` with `mean_score: null` until a human actually annotates that file. This is
+  the explicit, documented **NOT YET MEASURED** result required when ground truth (a human judgment,
+  here) doesn't yet exist — not a gap hidden from the report.
+
+**Grounding is a proxy, not hallucination detection.** Part F evaluates whether the LLM's
+`attack_vectors` claims are actually supported by the real retrieved threat-intel context text —
+chosen because those items are short, discrete phrases suitable for coarse automated checking, unlike
+the free-form `summary` field, which the task explicitly flags as a human-evaluation case rather than
+something to force through unreliable automated claim extraction. The method is stopword-filtered
+lexical word-overlap: a claim is "supported" if at least 40% of its significant words appear in the
+context text actually retrieved for that query. `mean_supported_ratio` reports `1.0` in this
+environment (5 cases). This is explicitly **not** reported as a hallucination rate, an accuracy
+figure, or "zero hallucinations" — the module's own `methodology_note` documents its two known
+failure modes: a paraphrased-but-genuinely-grounded claim can score as unsupported (no synonym
+matching), and a claim that coincidentally shares common words with the context can score as
+supported (no semantic/entailment verification). A rigorous claim-level audit would require human
+annotation or an entailment model — neither is implemented, and the proxy is never substituted for
+that stronger claim.
+
+**Reproducibility metadata.** Every report now includes an `environment` block —
+`platform.system()`/`platform.release()`, Python version, the `ollama --version` CLI output (when the
+binary is on `PATH`), the Ollama model name, a SHA-256-truncated hostname hash (never the raw
+hostname), and the fixed random seed — imported directly from `backend/ml/config.py`'s
+`RANDOM_STATE` rather than duplicated, so it can never silently drift from the value the ML split
+actually uses.
+
 **What genuine multi-class evaluation would require.** Everything above is architecturally ready
 for more than two classes (see **Multi-class-ready architecture (Phase 10)**) but is evaluated only
 on what real data actually supports. A defensible multi-class benchmark would need additional real,
@@ -2324,12 +2551,17 @@ backend/
         schemas.py             # dynamically-generated NetworkTrafficFeatures + classification schemas
         train.py                # uv run python -m backend.ml.train -- the only place the model is fit
         predictor.py             # loads the saved model; predict() + feature_importance()
-    evaluation/               # Phase 11: read-only evaluation/benchmarking layer -- see Evaluation & Benchmarking
+    evaluation/               # Phase 11 + 16: read-only evaluation/benchmarking layer -- see Evaluation & Benchmarking
         schemas.py             # typed report structures (every section independently optional)
         ml_evaluation.py         # held-out/full-dataset metrics, threshold analysis, calibration
         retrieval_evaluation.py   # vector/graph/hybrid retrieval latency + topic coverage
-        benchmark.py               # end-to-end pipeline stage latency (needs Ollama)
-        __main__.py                 # uv run python -m backend.evaluation [--pipeline] [--output PATH]
+        retrieval_relevance.py     # Phase 16: Recall/Precision/HitRate/MRR@k against real chunk metadata
+        hybrid_ablation.py          # Phase 16: vector-only vs hybrid relevance delta + evidence coverage
+        llm_evaluation.py            # Phase 16: automated structural checks + human-rubric CSV template
+        grounding.py                   # Phase 16: lexical-overlap grounding proxy for attack_vectors claims
+        environment.py                  # Phase 16: OS/Python/Ollama/seed capture for reproducibility
+        benchmark.py                     # end-to-end pipeline stage latency + per-stage % share (needs Ollama)
+        __main__.py                       # uv run python -m backend.evaluation [--pipeline] [--llm] [--output PATH]
     services/
         llm.py               # Ollama call + structured JSON-schema output + parsing
         llm_status.py         # lightweight Ollama reachability check for /health
@@ -2419,6 +2651,22 @@ structural boundary of this project's current scope.
 - **Retrieval benchmark is a sanity check, not a formal IR benchmark** — six queries (five real
   topics + one negative control), no independent relevance-judgment set — see **Evaluation &
   Benchmarking** > "Retrieval evaluation is coverage, not accuracy."
+- **Retrieval relevance ground truth is corpus-internal** — Recall/Precision/HitRate/MRR@k (Phase 16)
+  are computed against each chunk's own ingestion-time `threat_type` metadata, not an
+  independently-curated relevance-judgment set from a separate source — see **Evaluation &
+  Benchmarking** > "Retrieval relevance is now measured, not just coverage."
+- **Hybrid retrieval never re-ranks vector results** — the measured `relevance_delta` between
+  vector-only and hybrid is an exact `0.0` at every k because hybrid only adds graph evidence
+  alongside unchanged vector output in this architecture; a graph-only ranking condition isn't
+  meaningful here since graph lookup requires an already-resolved category, not a bare query — see
+  **Evaluation & Benchmarking** > "Hybrid ablation: the honest null result."
+- **LLM quality rubric requires human annotation** — `severity_reasonableness`,
+  `summary_grounding_quality`, and `attack_vectors_relevance` are **NOT YET MEASURED**; only a
+  ready-to-fill CSV template (`evaluation/llm_rubric_template.csv`) is generated, never fabricated
+  scores — see **Evaluation & Benchmarking** > "LLM evaluation: automated vs. human rubric."
+- **Grounding check is a coarse lexical-overlap proxy, not hallucination detection** — no semantic or
+  entailment verification, and only checks `attack_vectors` claims (not the free-form `summary`) —
+  see **Evaluation & Benchmarking** > "Grounding is a proxy, not hallucination detection."
 - **No trained classifier model is committed to the repository** (`models/` is gitignored) —
   `/classify` and `/analyze/classification` return `503` on a fresh checkout until someone runs
   `uv run python -m backend.ml.train` against a real CICIDS2017 CSV (see "Getting the dataset"). A

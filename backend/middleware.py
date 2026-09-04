@@ -2,6 +2,17 @@
 security response headers. Neither middleware participates in authentication -- the
 request ID is a correlation aid only, never a credential (see require_auth() in
 backend/security.py, which is untouched by this module).
+
+Phase 15 (observability): the request-completion/failure log lines below now also
+include `user_id`/`auth_method` when backend/security.py's require_auth() or
+require_user_id() dependency populated them on `request.state` earlier in the same
+request (dependencies run before the route body, which runs inside call_next() --
+by the time this middleware logs after call_next() returns, those fields are already
+set for any authenticated request). Public/unauthenticated endpoints simply never
+have them, so they're included only when present rather than as an explicit null,
+keeping those log lines exactly as before. This also feeds backend/metrics.py's
+`http_requests_total` / `http_request` duration metric, in the same place the access
+log line is already built, so the two never drift apart.
 """
 
 from __future__ import annotations
@@ -15,6 +26,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
+from backend import metrics
 from backend.logging_config import reset_request_id, set_request_id
 
 logger = logging.getLogger("backend.request")
@@ -43,6 +55,33 @@ def generate_request_id() -> str:
     return secrets.token_urlsafe(16)
 
 
+def _add_identity(extra: dict, request: Request) -> None:
+    """Adds user_id/auth_method to a log `extra` dict when backend/security.py's
+    require_auth()/require_user_id() dependency already resolved them for this
+    request (set on request.state, never read back into the auth decision itself --
+    see this module's docstring). Omitted entirely for public/unauthenticated
+    requests rather than logged as null, so an anonymous GET /health line looks
+    exactly as it did before this field existed."""
+    user_id = getattr(request.state, "user_id", None)
+    auth_method = getattr(request.state, "auth_method", None)
+    if user_id is not None:
+        extra["user_id"] = user_id
+    if auth_method is not None:
+        extra["auth_method"] = auth_method
+
+
+# GET /health and GET /ready are polled on a fixed interval by the frontend
+# (frontend/src/hooks/useHealth.ts, useReadiness.ts) purely to drive the sidebar's
+# system-status indicator -- not user-initiated, and not part of any investigation
+# pipeline this phase needs to trace. A busier production deployment might reasonably
+# suppress their access-log lines (or drop them to DEBUG) to cut noise. This project
+# deliberately does NOT do that: tests/test_request_id.py::test_request_id_appears_in_logs
+# already asserts that *every* request -- specifically GET /health, the simplest
+# possible case -- produces a request-correlated log line, and at this project's
+# traffic volume (a local/demo deployment) the noise is negligible. Revisit this if
+# real production log volume ever makes it worth the tradeoff.
+
+
 class RequestContextMiddleware(BaseHTTPMiddleware):
     """Assigns every request a correlation ID (accepting a caller-supplied
     X-Request-ID if it looks reasonable, otherwise generating one), exposes it via
@@ -69,28 +108,39 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                 response = await call_next(request)
             except Exception:
                 duration_ms = round((time.perf_counter() - start) * 1000, 2)
-                logger.exception(
-                    "request failed with an unhandled exception",
-                    extra={
-                        "event": "request_failed",
-                        "method": request.method,
-                        "path": request.url.path,
-                        "duration_ms": duration_ms,
-                    },
+                extra = {
+                    "event": "request_failed",
+                    "method": request.method,
+                    "path": request.url.path,
+                    "duration_ms": duration_ms,
+                }
+                _add_identity(extra, request)
+                logger.exception("request failed with an unhandled exception", extra=extra)
+                metrics.increment("http_requests_total", method=request.method, path=request.url.path, status="500")
+                metrics.observe_duration_ms(
+                    "http_request", duration_ms, method=request.method, path=request.url.path
                 )
                 raise
 
             duration_ms = round((time.perf_counter() - start) * 1000, 2)
             response.headers[REQUEST_ID_HEADER] = request_id
-            logger.info(
-                "request completed",
-                extra={
-                    "event": "request_completed",
-                    "method": request.method,
-                    "path": request.url.path,
-                    "status_code": response.status_code,
-                    "duration_ms": duration_ms,
-                },
+            extra = {
+                "event": "request_completed",
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+            }
+            _add_identity(extra, request)
+            logger.info("request completed", extra=extra)
+            metrics.increment(
+                "http_requests_total",
+                method=request.method,
+                path=request.url.path,
+                status=str(response.status_code),
+            )
+            metrics.observe_duration_ms(
+                "http_request", duration_ms, method=request.method, path=request.url.path
             )
             return response
         finally:

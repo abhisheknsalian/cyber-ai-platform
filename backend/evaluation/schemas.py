@@ -172,15 +172,177 @@ class PipelineBenchmark(BaseModel):
     queries_evaluated: int
     stages: list[PipelineStageLatency]
     note: str
+    # Phase 16, additive: each stage's mean latency as a percentage of
+    # "total_classify_and_analyze"'s mean -- answers "what fraction of end-to-end
+    # latency does each stage contribute" without adding a field to the existing,
+    # tested PipelineStageLatency/LatencyStats shapes (see
+    # tests/test_evaluation_benchmark.py's exact-field-set assertions on those).
+    # None when the benchmark has no "total_classify_and_analyze" stage to divide by.
+    stage_latency_share_pct: dict[str, float] | None = None
+
+
+# --- Phase 16: formal retrieval-relevance (Recall/Precision/HitRate/MRR @ k) -------
+#
+# Ground truth: a vector-store chunk's own `threat_type` metadata (set deterministically
+# at ingestion time, backend/rag/ingestion.py -- never invented for this evaluation).
+# For a query associated with category `c`, every chunk tagged threat_type == c in the
+# CURRENT collection is "relevant"; nothing else is. See
+# backend/evaluation/retrieval_relevance.py's module docstring for the full
+# methodology, including why this deliberately bypasses the production relevance
+# threshold to get raw top-k ranked results.
+
+
+class RelevanceMetricsAtK(BaseModel):
+    k: int
+    recall_at_k: float
+    precision_at_k: float
+    hit_rate_at_k: float
+    mrr_at_k: float
+
+
+class QueryRelevanceResult(BaseModel):
+    query: str
+    category: str
+    relevant_chunk_count: int
+    ranked_chunk_count: int
+    metrics: list[RelevanceMetricsAtK]
+
+
+class CategoryRelevanceReport(BaseModel):
+    category: str
+    query_count: int
+    relevant_chunk_count: int
+    metrics: list[RelevanceMetricsAtK]  # averaged over this category's queries, one row per k
+
+
+class RetrievalRelevanceReport(BaseModel):
+    k_values: list[int]
+    queries_evaluated: int
+    categories: list[CategoryRelevanceReport]
+    overall: list[RelevanceMetricsAtK]  # macro-averaged over all categories, one row per k
+    per_query: list[QueryRelevanceResult]
+    methodology_note: str
+
+
+# --- Phase 16: vector-only vs. hybrid (vector + graph) ablation --------------------
+
+
+class HybridAblationQueryResult(BaseModel):
+    query: str
+    category: str
+    vector_only_latency_ms: float
+    hybrid_latency_ms: float
+    graph_entity_count: int
+    graph_relationship_count: int
+    hybrid_added_graph_evidence: bool
+
+
+class HybridAblationReport(BaseModel):
+    queries_evaluated: int
+    # Recall@k/Precision@k/MRR are IDENTICAL between vector-only and hybrid in this
+    # architecture by construction -- hybrid retrieval augments vector results with
+    # graph evidence, it does not re-rank or filter them (see
+    # backend/intelligence/hybrid_retrieval.py::gather_hybrid_evidence()). Recorded
+    # here explicitly (delta == 0.0 for every k) rather than omitted, so that fact is
+    # a measured, documented finding -- not an assumption and not silently dropped.
+    vector_only_relevance: list[RelevanceMetricsAtK]
+    hybrid_relevance: list[RelevanceMetricsAtK]
+    relevance_delta: list[RelevanceMetricsAtK]  # hybrid - vector_only, per k; expect all-zero
+    mean_latency_overhead_ms: float  # hybrid_latency_ms - vector_only_latency_ms, averaged
+    evidence_coverage_rate: float  # fraction of queries where hybrid added >=1 graph relationship
+    mean_graph_entity_count: float
+    mean_graph_relationship_count: float
+    per_query: list[HybridAblationQueryResult]
+    methodology_note: str
+
+
+# --- Phase 16: LLM analysis evaluation ---------------------------------------------
+#
+# Only backend/services/llm.py's genuinely LLM-authored output fields are evaluated
+# here: severity, summary, attack_vectors, and the insufficient_context decision.
+# `threat`, `mitre_attack`, `indicators`, and `mitigations` are deterministically
+# derived from source documents / the threat graph in this architecture (see
+# backend/services/threat_analysis.py::analyze_query()), not LLM-generated -- treating
+# them as an "LLM quality" dimension would misattribute a backend-computed,
+# already-correct-by-construction value to the model.
+
+
+class LLMAutomatedMetrics(BaseModel):
+    cases_evaluated: int
+    schema_valid_rate: float  # fraction that produced a schema-conformant response at all
+    # Of the cases with a known-answerable query (one of the 5 real categories):
+    # fraction correctly NOT flagged insufficient_context.
+    correct_relevance_on_topic_rate: float | None
+    # Of the negative-control (off-topic) cases: fraction correctly flagged
+    # insufficient_context. None if no negative controls were run.
+    correct_relevance_off_topic_rate: float | None
+    non_empty_attack_vectors_rate: float  # among "analyzed" (non-insufficient-context) cases
+    severity_present_rate: float  # among "analyzed" cases
+
+
+class LLMRubricDimension(BaseModel):
+    """A dimension that genuinely requires human judgment. `scores` is empty until a
+    human annotator fills in the CSV/JSON template this module writes -- see
+    backend/evaluation/llm_evaluation.py::write_rubric_template()."""
+
+    name: str
+    description: str
+    scale_description: str  # e.g. "0=incorrect, 1=partially correct, 2=correct"
+    status: Literal["not_yet_annotated", "annotated"]
+    mean_score: float | None = None
+    scores: list[int] = Field(default_factory=list)
+
+
+class LLMEvaluationReport(BaseModel):
+    automated: LLMAutomatedMetrics
+    rubric_dimensions: list[LLMRubricDimension]
+    rubric_template_path: str | None
+    methodology_note: str
+
+
+# --- Phase 16: grounding / hallucination-proxy check --------------------------------
+
+
+class GroundingQueryResult(BaseModel):
+    query: str
+    category: str
+    claims_checked: int
+    claims_supported: int
+    supported_ratio: float | None  # None if claims_checked == 0
+
+
+class GroundingReport(BaseModel):
+    cases_evaluated: int
+    mean_supported_ratio: float | None
+    per_query: list[GroundingQueryResult]
+    methodology_note: str
+
+
+class EnvironmentInfo(BaseModel):
+    """Reproducibility metadata -- Phase 16. Captured fresh at report-generation time,
+    never hardcoded."""
+
+    os: str
+    os_version: str
+    python_version: str
+    hostname_hash: str  # sha256 prefix, not the raw hostname -- identifying, not secret, but no reason to publish it verbatim
+    ollama_cli_version: str | None
+    ollama_model: str
+    random_seed: int
 
 
 class EvaluationReport(BaseModel):
     generated_at: str
+    environment: EnvironmentInfo | None = None
     dataset: DatasetSummary | None
     model: ModelSummary | None
     classification: dict[str, ClassificationMetrics] = Field(default_factory=dict)
     threshold_analysis: ThresholdAnalysis | None = None
     calibration: CalibrationReport | None = None
     retrieval: RetrievalBenchmark | None = None
+    retrieval_relevance: RetrievalRelevanceReport | None = None
+    hybrid_ablation: HybridAblationReport | None = None
+    llm_evaluation: LLMEvaluationReport | None = None
+    grounding: GroundingReport | None = None
     pipeline: PipelineBenchmark | None = None
     limitations: list[str] = Field(default_factory=list)

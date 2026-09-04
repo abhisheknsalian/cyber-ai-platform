@@ -7,6 +7,14 @@ Defaults to a local SQLite file (./data/cyber_ai.db) so non-Docker local dev and
 `uv run pytest` need no external database -- see README "Database Architecture".
 docker-compose.yml/docker-compose.prod.yml both set DATABASE_URL to the dedicated
 `db` (Postgres) service instead.
+
+SQLite does NOT enforce foreign keys by default (it parses and stores FK constraints
+but never checks them unless a per-connection pragma is set) -- without the connect
+event below, `ON DELETE CASCADE` on investigations/classification_results/
+analysis_results (Phase 14, backend/db/models.py) would silently do nothing on
+SQLite while working correctly on PostgreSQL, which enforces FKs unconditionally.
+Postgres ignores this pragma path entirely (the listener only fires for SQLite
+connections), so this has no effect there.
 """
 
 from __future__ import annotations
@@ -15,7 +23,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 _DEFAULT_SQLITE_URL = "sqlite:///./data/cyber_ai.db"
@@ -28,6 +36,12 @@ def database_url() -> str:
     return os.getenv("DATABASE_URL", _DEFAULT_SQLITE_URL)
 
 
+def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+
 def get_engine() -> Engine:
     global _engine
     if _engine is None:
@@ -37,6 +51,11 @@ def get_engine() -> Engine:
         # Postgres, where this arg isn't accepted, hence the conditional.
         connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
         _engine = create_engine(url, connect_args=connect_args, pool_pre_ping=True, future=True)
+        if url.startswith("sqlite"):
+            # Fires on every new DBAPI connection (each one is a fresh SQLite
+            # connection under the hood) -- a single PRAGMA at startup would not
+            # apply to connections opened later from the pool.
+            event.listen(_engine, "connect", _enable_sqlite_foreign_keys)
     return _engine
 
 

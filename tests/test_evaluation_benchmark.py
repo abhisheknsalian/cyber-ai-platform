@@ -120,3 +120,24 @@ def test_pipeline_benchmark_stages_are_json_serializable_numeric_data_only():
     for stage in dumped["stages"]:
         assert set(stage.keys()) == {"stage", "latency"}
         assert set(stage["latency"].keys()) == {"count", "mean_ms", "p50_ms", "p95_ms", "min_ms", "max_ms"}
+
+
+def test_pipeline_benchmark_computes_stage_latency_share_of_total():
+    """Phase 16, Part H: each stage's mean latency as a percentage of
+    total_classify_and_analyze's mean -- added as a new PipelineBenchmark field, not
+    a change to the existing PipelineStageLatency/LatencyStats shapes asserted above."""
+    with (
+        patch("backend.evaluation.benchmark.generate_analysis_fragment", return_value=_FRAGMENT) as mocked_local,
+        patch("backend.services.threat_analysis.generate_analysis_fragment", return_value=_FRAGMENT) as mocked_pipeline,
+    ):
+        result = run_pipeline_benchmark(sample_size=2)
+
+    assert mocked_local.call_count == 3
+    assert mocked_pipeline.call_count == 2
+
+    assert result.stage_latency_share_pct is not None
+    assert set(result.stage_latency_share_pct) == _STAGE_NAMES
+    # total_classify_and_analyze is always 100% of itself.
+    assert result.stage_latency_share_pct["total_classify_and_analyze"] == pytest.approx(100.0)
+    for value in result.stage_latency_share_pct.values():
+        assert value >= 0.0

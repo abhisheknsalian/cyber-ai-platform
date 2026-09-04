@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from backend.config_validation import ConfigurationError, validate_startup_config
 from backend.intelligence.graph_store import get_graph
@@ -18,8 +18,19 @@ from backend.intelligence.schemas import (
     IntelligenceSearchResult,
     ThreatGraphNeighborhood,
 )
+from backend.investigations.schemas import (
+    AnalysisResultCreateRequest,
+    ClassificationResultCreateRequest,
+    InvestigationCreateRequest,
+    InvestigationCreateResponse,
+    InvestigationDetail,
+    InvestigationListResponse,
+    StoredAnalysisResult,
+    StoredClassificationResult,
+)
+from backend import metrics
 from backend.logging_config import configure_logging
-from backend.middleware import RequestContextMiddleware, SecurityHeadersMiddleware
+from backend.middleware import REQUEST_ID_HEADER, RequestContextMiddleware, SecurityHeadersMiddleware
 from backend.ml.predictor import ModelUnavailableError, feature_importance, model_available, predict
 from backend.ml.schemas import (
     ClassificationAnalysisRequest,
@@ -43,10 +54,12 @@ from backend.models.schemas import (
 from backend.rag.config import COLLECTION_NAME
 from backend.rag.retrieval import vector_store_available, vector_store_chunk_count
 from backend.rate_limit import enforce_ai_rate_limit, enforce_login_rate_limit
-from backend.security import require_auth
+from backend.security import require_auth, require_user_id
 from backend.services import auth as auth_service
+from backend.services import investigations as investigations_service
 from backend.services import users as users_service
 from backend.services.classification import UnsupportedPredictionError, classify_and_analyze
+from backend.services.investigations import AnalysisAlreadyExistsError
 from backend.services.knowledge_base import list_threat_categories
 from backend.services.llm import LLMResponseError, LLMUnavailableError
 from backend.services.llm_status import check_llm_status
@@ -115,6 +128,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "Authorization", "X-CSRF-Token"],
+    # Phase 15: without this, browser JS cannot read the X-Request-ID response
+    # header on a cross-origin response (only a small CORS-safelisted set of
+    # response headers is exposed to script by default) -- the frontend's own
+    # request_id fallback (frontend/src/services/api.ts, when a response body isn't
+    # JSON-parseable) depends on being able to read it.
+    expose_headers=[REQUEST_ID_HEADER],
 )
 
 
@@ -179,7 +198,7 @@ def register(
         logger.exception("Unexpected error during registration")
         raise HTTPException(status_code=500, detail="An unexpected error occurred while registering.")
 
-    logger.info("Registration succeeded", extra={"event": "register_success"})
+    logger.info("Registration succeeded", extra={"event": "register_success", "user_id": user.id})
     return UserPublicResponse(id=user.id, username=user.username, created_at=user.created_at)
 
 
@@ -202,7 +221,7 @@ def login(
         logger.exception("Unexpected error during login")
         raise HTTPException(status_code=500, detail="An unexpected error occurred while logging in.")
 
-    logger.info("Login succeeded", extra={"event": "login_success"})
+    logger.info("Login succeeded", extra={"event": "login_success", "user_id": user_id})
     _set_auth_cookies(response, session_token, csrf_token)
     return AuthStatusResponse(authenticated=True, username=username, user_id=user_id)
 
@@ -211,8 +230,16 @@ def login(
 def logout(request: Request, response: Response) -> AuthStatusResponse:
     """Destroys the current session, if any. Public and idempotent -- calling it
     with no session (or an already-expired one) still succeeds."""
-    auth_service.logout(request.cookies.get(SESSION_COOKIE_NAME))
+    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    # Read identity BEFORE destroying the session -- there's nothing left to look up
+    # afterward. None for an already-expired/nonexistent session (still a normal,
+    # successful no-op logout; nothing to log beyond that).
+    identity = session_identity(session_token)
+    auth_service.logout(session_token)
     _clear_auth_cookies(response)
+    if identity is not None:
+        user_id, _username = identity
+        logger.info("Logout succeeded", extra={"event": "logout", "user_id": user_id})
     return AuthStatusResponse(authenticated=False)
 
 
@@ -265,6 +292,18 @@ def ready(response: Response) -> ReadinessResponse:
     is_ready = checks.vector_store and checks.llm and checks.classifier
     response.status_code = 200 if is_ready else 503
     return ReadinessResponse(ready=is_ready, checks=checks)
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics_endpoint() -> str:
+    """In-process counters/durations (backend/metrics.py) in Prometheus text
+    exposition format -- HTTP request counts/latency, ML/RAG/graph/LLM/persistence
+    counts and latency, all built from the exact same instrumentation points as the
+    structured logs above. Public, like GET /health -- no request-scoped or secret
+    data is exposed, only aggregate counters. See README "Observability" for why
+    this is a small in-process registry rather than a real Prometheus/Grafana stack.
+    """
+    return metrics.render_prometheus_text()
 
 
 @app.get("/threats", response_model=list[ThreatCategory])
@@ -496,6 +535,95 @@ def analyze_classification(
             status_code=500,
             detail="An unexpected error occurred while analyzing the classification.",
         )
+
+
+# --- Persistent investigations (Phase 14) -------------------------------------
+#
+# Session-user-only (require_user_id, not require_auth): API-key clients and the
+# demo/bootstrap session have no real users.id to own a row here -- see
+# backend/security.py::require_user_id's docstring. Deliberately never invoke the
+# classifier/RAG/graph/LLM -- these endpoints only persist a result POST /classify or
+# POST /analyze/classification already computed and returned to the caller (see
+# backend/services/investigations.py's module docstring for the full rationale).
+# Every lookup is ownership-scoped in the query itself (see that module) -- a missing
+# investigation and one owned by a different user are both reported as plain 404s.
+
+
+@app.post("/investigations", response_model=InvestigationCreateResponse, status_code=201)
+def create_investigation(
+    payload: InvestigationCreateRequest,
+    user_id: int = Depends(require_user_id),
+) -> InvestigationCreateResponse:
+    """Creates an empty investigation owned by the current registered user."""
+    return investigations_service.create_investigation(user_id, payload.label)
+
+
+@app.get("/investigations", response_model=InvestigationListResponse)
+def list_investigations(
+    limit: int = 20,
+    offset: int = 0,
+    user_id: int = Depends(require_user_id),
+) -> InvestigationListResponse:
+    """The current user's own investigations only, most-recently-updated first."""
+    return investigations_service.list_investigations(user_id, limit, offset)
+
+
+@app.get("/investigations/{investigation_id}", response_model=InvestigationDetail)
+def get_investigation(
+    investigation_id: int,
+    user_id: int = Depends(require_user_id),
+) -> InvestigationDetail:
+    """Full investigation detail: all classification_results (oldest -> newest) and
+    each one's optional analysis_result. 404 for both a nonexistent id and one owned
+    by someone else -- see backend/services/investigations.py's module docstring."""
+    detail = investigations_service.get_investigation_detail(user_id, investigation_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Investigation not found.")
+    return detail
+
+
+@app.post(
+    "/investigations/{investigation_id}/classification-results",
+    response_model=StoredClassificationResult,
+    status_code=201,
+)
+def create_classification_result(
+    investigation_id: int,
+    payload: ClassificationResultCreateRequest,
+    user_id: int = Depends(require_user_id),
+) -> StoredClassificationResult:
+    """Persists a POST /classify result the caller already received -- does not
+    invoke the classifier again."""
+    result = investigations_service.add_classification_result(user_id, investigation_id, payload)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Investigation not found.")
+    return result
+
+
+@app.post(
+    "/investigations/{investigation_id}/classification-results/{result_id}/analysis-result",
+    response_model=StoredAnalysisResult,
+    status_code=201,
+)
+def create_analysis_result(
+    investigation_id: int,
+    result_id: int,
+    payload: AnalysisResultCreateRequest,
+    user_id: int = Depends(require_user_id),
+) -> StoredAnalysisResult:
+    """Persists a POST /analyze/classification result the caller already received --
+    does not invoke RAG, graph retrieval, or the LLM again. 404 if `result_id` isn't a
+    classification_result that actually belongs to `investigation_id` (prevents
+    supplying a valid id from a different investigation -- see
+    backend/services/investigations.py::_owned_classification_result). 409 if that
+    classification_result already has an analysis_result."""
+    try:
+        result = investigations_service.add_analysis_result(user_id, investigation_id, result_id, payload)
+    except AnalysisAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if result is None:
+        raise HTTPException(status_code=404, detail="Investigation or classification result not found.")
+    return result
 
 
 # --- Error response envelope -------------------------------------------------
