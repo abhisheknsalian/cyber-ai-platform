@@ -38,8 +38,8 @@ from backend.services.classification import PREDICTION_TO_QUERY, PREDICTION_TO_T
 from backend.services.llm import LLMUnavailableError, generate_analysis_fragment
 
 _PIPELINE_SAMPLE_SIZE = 10
-_DDOS_QUERY = PREDICTION_TO_QUERY["DDoS"]
-_DDOS_THREAT_STEM = PREDICTION_TO_THREAT_STEM["DDoS"]
+DDOS_QUERY = PREDICTION_TO_QUERY["DDoS"]
+DDOS_THREAT_STEM = PREDICTION_TO_THREAT_STEM["DDoS"]
 
 
 class PipelineUnavailableError(RuntimeError):
@@ -48,7 +48,7 @@ class PipelineUnavailableError(RuntimeError):
     benchmark never substitutes a mocked or fabricated stage for one it can't run."""
 
 
-def _sample_ddos_rows(n: int, data_path=RAW_DATA_PATH) -> list[NetworkTrafficFeatures]:
+def sample_ddos_rows(n: int, data_path=RAW_DATA_PATH) -> list[NetworkTrafficFeatures]:
     """Real DDoS rows from the real dataset, converted to the same
     NetworkTrafficFeatures schema POST /classify validates against -- exercises the
     classifier the same way a real request would, not a synthetic feature vector."""
@@ -66,7 +66,7 @@ def run_pipeline_benchmark(*, sample_size: int = _PIPELINE_SAMPLE_SIZE) -> Pipel
             "Vector store not found. Build it first with: uv run python -m backend.rag.ingestion"
         )
 
-    features_samples = _sample_ddos_rows(sample_size)
+    features_samples = sample_ddos_rows(sample_size)
     if not features_samples:
         raise PipelineUnavailableError("No DDoS rows available in the dataset to benchmark with.")
 
@@ -76,7 +76,7 @@ def run_pipeline_benchmark(*, sample_size: int = _PIPELINE_SAMPLE_SIZE) -> Pipel
     # the reported llm_analysis statistics, and fails fast here rather than after
     # already spending time on the classifier/retrieval stages below.
     try:
-        generate_analysis_fragment(_DDOS_QUERY, "Warm-up call; this response is discarded and not measured.")
+        generate_analysis_fragment(DDOS_QUERY, "Warm-up call; this response is discarded and not measured.")
     except LLMUnavailableError as exc:
         raise PipelineUnavailableError(f"Ollama is not reachable: {exc}") from exc
 
@@ -87,7 +87,7 @@ def run_pipeline_benchmark(*, sample_size: int = _PIPELINE_SAMPLE_SIZE) -> Pipel
     llm_latencies: list[float] = []
     total_latencies: list[float] = []
 
-    graph_stem = slug_for(_DDOS_THREAT_STEM)
+    graph_stem = slug_for(DDOS_THREAT_STEM)
 
     for features in features_samples:
         start = time.perf_counter()
@@ -95,7 +95,7 @@ def run_pipeline_benchmark(*, sample_size: int = _PIPELINE_SAMPLE_SIZE) -> Pipel
         classifier_latencies.append((time.perf_counter() - start) * 1000)
 
         start = time.perf_counter()
-        relevant = retrieve_relevant(_DDOS_QUERY)
+        relevant = retrieve_relevant(DDOS_QUERY)
         vector_latencies.append((time.perf_counter() - start) * 1000)
 
         start = time.perf_counter()
@@ -103,12 +103,12 @@ def run_pipeline_benchmark(*, sample_size: int = _PIPELINE_SAMPLE_SIZE) -> Pipel
         graph_latencies.append((time.perf_counter() - start) * 1000)
 
         start = time.perf_counter()
-        gather_hybrid_evidence(_DDOS_QUERY, threat_hint=_DDOS_THREAT_STEM)
+        gather_hybrid_evidence(DDOS_QUERY, threat_hint=DDOS_THREAT_STEM)
         hybrid_latencies.append((time.perf_counter() - start) * 1000)
 
         # Same context-building step analyze_query() performs before calling the LLM
         # (backend/services/threat_analysis.py) -- isolating only the LLM call itself.
-        primary_chunks = [(doc, score) for doc, score in relevant if doc.metadata.get("threat_type") == _DDOS_THREAT_STEM]
+        primary_chunks = [(doc, score) for doc, score in relevant if doc.metadata.get("threat_type") == DDOS_THREAT_STEM]
         retrieved_text = "\n\n".join(doc.page_content for doc, _score in primary_chunks)
         classifier_evidence = ClassifierEvidence(
             prediction=classification.prediction, probability=classification.probability, model=classification.model
@@ -117,7 +117,7 @@ def run_pipeline_benchmark(*, sample_size: int = _PIPELINE_SAMPLE_SIZE) -> Pipel
 
         start = time.perf_counter()
         try:
-            generate_analysis_fragment(_DDOS_QUERY, context)
+            generate_analysis_fragment(DDOS_QUERY, context)
         except LLMUnavailableError as exc:
             raise PipelineUnavailableError(f"Ollama is not reachable: {exc}") from exc
         llm_latencies.append((time.perf_counter() - start) * 1000)

@@ -12,9 +12,11 @@ import pytest
 
 from backend.evaluation.grounding import (
     GroundingEvaluationUnavailableError,
-    _is_supported,
-    _significant_words,
+    _split_sentences,
+    is_supported,
     run_grounding_evaluation,
+    semantic_supported,
+    significant_words,
 )
 from backend.models.schemas import LLMAnalysisFragment
 
@@ -24,8 +26,8 @@ from backend.models.schemas import LLMAnalysisFragment
 # ---------------------------------------------------------------------------
 
 
-def test_significant_words_drops_stopwords_and_short_tokens():
-    words = _significant_words("The attacker used a phishing email to steal credentials")
+def testsignificant_words_drops_stopwords_and_short_tokens():
+    words = significant_words("The attacker used a phishing email to steal credentials")
     assert "the" not in words
     assert "a" not in words
     assert "to" not in words
@@ -33,18 +35,18 @@ def test_significant_words_drops_stopwords_and_short_tokens():
     assert "credentials" in words
 
 
-def test_claim_is_supported_when_overlap_meets_threshold():
+def test_claimis_supported_when_overlap_meets_threshold():
     context_words = {"phishing", "credentials", "email", "attacker", "spoofing"}
-    assert _is_supported("phishing email credentials", context_words) is True
+    assert is_supported("phishing email credentials", context_words) is True
 
 
 def test_claim_is_not_supported_when_overlap_is_below_threshold():
     context_words = {"ransomware", "encryption", "payment"}
-    assert _is_supported("phishing email credentials theft", context_words) is False
+    assert is_supported("phishing email credentials theft", context_words) is False
 
 
 def test_empty_claim_is_never_supported():
-    assert _is_supported("", {"anything"}) is False
+    assert is_supported("", {"anything"}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -138,3 +140,56 @@ def test_report_round_trips_through_json():
         report = run_grounding_evaluation([("Explain phishing attacks", "phishing")])
     reloaded = GroundingReport.model_validate(report.model_dump())
     assert reloaded.cases_evaluated == report.cases_evaluated
+
+
+# ---------------------------------------------------------------------------
+# Phase 17: semantic (embedding-based) grounding proxy.
+# ---------------------------------------------------------------------------
+
+
+def test_split_sentences_splits_bullet_lists_into_separate_lines():
+    text = "Intro sentence.\n- fake login pages\n- credential harvesting\n- malicious links"
+    lines = _split_sentences(text)
+    assert "fake login pages" in lines
+    assert "credential harvesting" in lines
+    assert "malicious links" in lines
+    # Bullet dash is stripped, not left as part of the line.
+    assert all(not line.startswith("-") for line in lines)
+
+
+def test_split_sentences_drops_empty_lines():
+    assert _split_sentences("one\n\n\ntwo") == ["one", "two"]
+
+
+def test_semantic_supported_true_for_a_genuinely_matching_claim():
+    context = ["fake login pages", "email spoofing", "malicious links"]
+    assert semantic_supported("fake login pages used for phishing", context) is True
+
+
+def test_semantic_supported_false_for_an_empty_claim_or_empty_context():
+    assert semantic_supported("", ["fake login pages"]) is False
+    assert semantic_supported("fake login pages", []) is False
+
+
+def test_grounded_attack_vector_scores_supported_semantically_too():
+    fragment = LLMAnalysisFragment(
+        severity="High", summary="Test summary.", attack_vectors=["credential harvesting phishing"],
+        indicators=["test indicator"], mitigations=["test mitigation"], insufficient_context=False,
+    )
+    with patch("backend.services.threat_analysis.generate_analysis_fragment", return_value=fragment):
+        report = run_grounding_evaluation([("Explain phishing attacks", "phishing")])
+
+    assert report.per_query[0].supported_ratio_semantic == 1.0
+    assert report.mean_supported_ratio_semantic == 1.0
+
+
+def test_unrelated_attack_vector_scores_zero_semantically():
+    fragment = LLMAnalysisFragment(
+        severity="High", summary="Test summary.",
+        attack_vectors=["completely unrelated fabricated nonsense zebra giraffe"],
+        indicators=["test indicator"], mitigations=["test mitigation"], insufficient_context=False,
+    )
+    with patch("backend.services.threat_analysis.generate_analysis_fragment", return_value=fragment):
+        report = run_grounding_evaluation([("Explain phishing attacks", "phishing")])
+
+    assert report.per_query[0].supported_ratio_semantic == 0.0
