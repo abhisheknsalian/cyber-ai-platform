@@ -119,7 +119,9 @@ def test_pipeline_benchmark_stages_are_json_serializable_numeric_data_only():
     assert "IGNORE ALL PREVIOUS INSTRUCTIONS" not in serialized
     for stage in dumped["stages"]:
         assert set(stage.keys()) == {"stage", "latency"}
-        assert set(stage["latency"].keys()) == {"count", "mean_ms", "p50_ms", "p95_ms", "min_ms", "max_ms"}
+        assert set(stage["latency"].keys()) == {
+            "count", "mean_ms", "p50_ms", "p95_ms", "min_ms", "max_ms", "stddev_ms",
+        }
 
 
 def test_pipeline_benchmark_computes_stage_latency_share_of_total():

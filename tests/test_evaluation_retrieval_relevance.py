@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from backend.evaluation.retrieval_relevance import (
+    EVALUATION_QUERIES,
     RelevanceEvaluationUnavailableError,
     average_metrics_at_k,
     compute_metrics_at_k,
@@ -78,7 +79,8 @@ def test_average_metrics_at_k_averages_only_matching_k_rows():
 
 def test_evaluates_all_configured_queries_and_categories():
     report = run_retrieval_relevance_evaluation()
-    assert report.queries_evaluated == 15
+    # Phase 17 (RQ2) expanded EVALUATION_QUERIES from 3 to 5 per category (25 total).
+    assert report.queries_evaluated == len(EVALUATION_QUERIES) == 25
     assert {c.category for c in report.categories} == {
         "phishing", "ransomware", "ddos_attack", "sql_injection", "botnet",
     }

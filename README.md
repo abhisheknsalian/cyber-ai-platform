@@ -2337,11 +2337,22 @@ returns.
 threat graph. It only loads and measures what already exists, against the real local CICIDS2017
 CSV and the real trained model artifact (not the tests' synthetic fixture).
 
+**Phase 17 note:** this section covers what the evaluation tooling *is* and how to run it. For the
+thesis-grade research questions (does the reported ~99.99% accuracy actually demonstrate
+generalization, or is it partly explained by near-duplicate flows in this specific CICIDS2017
+capture? is hybrid retrieval's contribution ranking or evidence enrichment? etc.), the full
+methodology, leakage audit, statistical treatment, and threats-to-validity discussion live in
+[`docs/THESIS_EVALUATION.md`](docs/THESIS_EVALUATION.md) — this section stays focused on the
+tooling itself.
+
 ```bash
 uv run python -m backend.evaluation                 # offline: ML + retrieval + relevance + hybrid ablation, no Ollama needed
 uv run python -m backend.evaluation --pipeline       # also runs the end-to-end pipeline benchmark (needs Ollama)
 uv run python -m backend.evaluation --llm            # also runs LLM evaluation + grounding (needs Ollama)
-uv run python -m backend.evaluation --pipeline --llm --output path.json
+uv run python -m backend.evaluation --leakage        # Phase 17 RQ1: data-leakage audit + generalization experiment (offline, ~1 min)
+uv run python -m backend.evaluation --reliability    # Phase 17 RQ5: repeated end-to-end runs, success/failure rate (needs Ollama)
+uv run python -m backend.evaluation --ablation       # Phase 17 RQ6/RQ3: component ablation + hybrid downstream usefulness (needs Ollama)
+uv run python -m backend.evaluation --full --output evaluation/latest.json   # everything above, plus evaluation/thesis_tables.md
 ```
 
 Requires the same local artifacts the rest of the README does: the real dataset at
@@ -2551,17 +2562,24 @@ backend/
         schemas.py             # dynamically-generated NetworkTrafficFeatures + classification schemas
         train.py                # uv run python -m backend.ml.train -- the only place the model is fit
         predictor.py             # loads the saved model; predict() + feature_importance()
-    evaluation/               # Phase 11 + 16: read-only evaluation/benchmarking layer -- see Evaluation & Benchmarking
+    evaluation/               # Phase 11 + 16 + 17: read-only evaluation/benchmarking layer -- see Evaluation & Benchmarking, docs/THESIS_EVALUATION.md
         schemas.py             # typed report structures (every section independently optional)
-        ml_evaluation.py         # held-out/full-dataset metrics, threshold analysis, calibration
-        retrieval_evaluation.py   # vector/graph/hybrid retrieval latency + topic coverage
-        retrieval_relevance.py     # Phase 16: Recall/Precision/HitRate/MRR@k against real chunk metadata
-        hybrid_ablation.py          # Phase 16: vector-only vs hybrid relevance delta + evidence coverage
-        llm_evaluation.py            # Phase 16: automated structural checks + human-rubric CSV template
-        grounding.py                   # Phase 16: lexical-overlap grounding proxy for attack_vectors claims
-        environment.py                  # Phase 16: OS/Python/Ollama/seed capture for reproducibility
-        benchmark.py                     # end-to-end pipeline stage latency + per-stage % share (needs Ollama)
-        __main__.py                       # uv run python -m backend.evaluation [--pipeline] [--llm] [--output PATH]
+        statistics.py            # Phase 17: Wilson score + bootstrap confidence intervals
+        ml_evaluation.py           # held-out/full-dataset metrics, threshold analysis, calibration
+        leakage_audit.py             # Phase 17 RQ1: exact/near-duplicate + cross-label + family-grouping audit
+        generalization_experiment.py  # Phase 17 RQ1: baseline vs family-grouped split vs repeated-seed variance
+        retrieval_evaluation.py         # vector/graph/hybrid retrieval latency + topic coverage
+        retrieval_relevance.py           # Phase 16/17: Recall/Precision/HitRate/MRR@k (25 queries) against real chunk metadata
+        hybrid_ablation.py                 # Phase 16: vector-only vs hybrid relevance delta + evidence coverage
+        hybrid_downstream.py                 # Phase 17 RQ3: does graph evidence change the LLM's downstream output
+        llm_evaluation.py                      # Phase 16: automated structural checks + human-rubric CSV template
+        grounding.py                             # Phase 16/17: lexical + embedding-based (semantic) grounding proxies
+        component_ablation.py                      # Phase 17 RQ6: progressive ML/vector/hybrid/LLM component ablation
+        reliability.py                               # Phase 17 RQ5: repeated end-to-end runs, success/failure rate
+        environment.py                                 # Phase 16: OS/Python/Ollama/seed capture for reproducibility
+        benchmark.py                                     # end-to-end pipeline stage latency + per-stage % share (needs Ollama)
+        thesis_tables.py                                   # Phase 17: renders Markdown tables FROM a saved JSON report
+        __main__.py                                         # uv run python -m backend.evaluation [flags] [--output PATH]
     services/
         llm.py               # Ollama call + structured JSON-schema output + parsing
         llm_status.py         # lightweight Ollama reachability check for /health
@@ -2618,6 +2636,18 @@ structural boundary of this project's current scope.
 
 ### ML & dataset
 
+- **Substantial near-duplicate train/test similarity limits the generalization claim (Phase 17
+  finding)** — a standardized nearest-neighbor audit found that 71.0% of a random held-out test
+  sample has a training-set row within 0.01 standardized Euclidean distance (median distance
+  0.0005), consistent with CICIDS2017's documented automated-attack generation process and
+  published critiques of this dataset family (Engelen et al., 2021). Exact-duplicate rows are
+  already removed before the split (verified, structural), but near-duplicates are not. **This is
+  strong evidence that limits how much the ~99.99% accuracy can be trusted as a generalization
+  claim — it is not a proof that near-duplication caused that score** (no controlled experiment
+  here isolates near-duplicate structure as a variable and re-measures accuracy with it removed) —
+  see [`docs/THESIS_EVALUATION.md`](docs/THESIS_EVALUATION.md) §4 for the full leakage audit and
+  this exact distinction, including why a temporal/host-level split is NOT MEASURABLE from this
+  specific CSV distribution.
 - **Binary dataset only** — the local CICIDS2017 capture contains exactly `BENIGN`/`DDoS`, a single
   Friday-afternoon capture file, not a multi-day or multi-scenario collection. Accuracy figures
   describe separability of *this* binary problem on *this* capture, not general attack detection —
@@ -2651,22 +2681,35 @@ structural boundary of this project's current scope.
 - **Retrieval benchmark is a sanity check, not a formal IR benchmark** — six queries (five real
   topics + one negative control), no independent relevance-judgment set — see **Evaluation &
   Benchmarking** > "Retrieval evaluation is coverage, not accuracy."
-- **Retrieval relevance ground truth is corpus-internal** — Recall/Precision/HitRate/MRR@k (Phase 16)
-  are computed against each chunk's own ingestion-time `threat_type` metadata, not an
-  independently-curated relevance-judgment set from a separate source — see **Evaluation &
-  Benchmarking** > "Retrieval relevance is now measured, not just coverage."
+- **Retrieval relevance ground truth is corpus-internal** — Recall/Precision/HitRate/MRR@k (Phase
+  16/17, 25 queries) are computed against each chunk's own ingestion-time `threat_type` metadata, not
+  an independently-curated relevance-judgment set from a separate source; the 14-chunk corpus also
+  caps how much additional statistical power more queries can add — see
+  [`docs/THESIS_EVALUATION.md`](docs/THESIS_EVALUATION.md) §5.
 - **Hybrid retrieval never re-ranks vector results** — the measured `relevance_delta` between
   vector-only and hybrid is an exact `0.0` at every k because hybrid only adds graph evidence
   alongside unchanged vector output in this architecture; a graph-only ranking condition isn't
-  meaningful here since graph lookup requires an already-resolved category, not a bare query — see
-  **Evaluation & Benchmarking** > "Hybrid ablation: the honest null result."
+  meaningful here since graph lookup requires an already-resolved category, not a bare query. Its
+  real, MEASURED downstream contribution (Phase 17): removing graph evidence changed the LLM's
+  `attack_vectors` and reduced its mitigations in 40% of a 5-case sample — see
+  [`docs/THESIS_EVALUATION.md`](docs/THESIS_EVALUATION.md) §7.
 - **LLM quality rubric requires human annotation** — `severity_reasonableness`,
-  `summary_grounding_quality`, and `attack_vectors_relevance` are **NOT YET MEASURED**; only a
-  ready-to-fill CSV template (`evaluation/llm_rubric_template.csv`) is generated, never fabricated
-  scores — see **Evaluation & Benchmarking** > "LLM evaluation: automated vs. human rubric."
-- **Grounding check is a coarse lexical-overlap proxy, not hallucination detection** — no semantic or
-  entailment verification, and only checks `attack_vectors` claims (not the free-form `summary`) —
-  see **Evaluation & Benchmarking** > "Grounding is a proxy, not hallucination detection."
+  `summary_grounding_quality`, and `attack_vectors_relevance` are **IMPLEMENTED / NOT YET
+  MEASURED**; only a ready-to-fill CSV template (`evaluation/llm_rubric_template.csv`) is generated,
+  never fabricated scores, and this session deliberately did not have an AI model fill it in (that
+  would collapse the automated/human distinction the evaluation exists to preserve). Only one
+  annotator is realistically available for a single-author thesis, so no inter-rater reliability
+  statistic can be computed if/when it is annotated — see
+  [`docs/THESIS_EVALUATION.md`](docs/THESIS_EVALUATION.md) §8.
+- **Grounding checks are proxies, not hallucination/factuality/truth detection** — a lexical-overlap
+  proxy (Phase 16) and a complementary embedding-cosine-similarity proxy (Phase 17, reusing the same
+  all-MiniLM-L6-v2 model production RAG already loads — no new model, no cloud API) both only check
+  `attack_vectors` claims (not the free-form `summary`), and neither performs semantic entailment or
+  fact verification. **The semantic proxy's threshold has known calibration leakage** — it was
+  selected by observing this proxy's real output on one of the same 5 cases it later scores by
+  default, with no independent calibration set — see
+  [`docs/THESIS_EVALUATION.md`](docs/THESIS_EVALUATION.md) §9 for the full audit and a threshold
+  sensitivity sweep.
 - **No trained classifier model is committed to the repository** (`models/` is gitignored) —
   `/classify` and `/analyze/classification` return `503` on a fresh checkout until someone runs
   `uv run python -m backend.ml.train` against a real CICIDS2017 CSV (see "Getting the dataset"). A
