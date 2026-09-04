@@ -318,6 +318,13 @@ def _print_summary(report: EvaluationReport) -> None:
         ge = report.generalization_experiment
         print(f"\nGeneralization experiment: baseline acc={ge.baseline.accuracy} vs family_grouped acc={ge.family_grouped.accuracy if ge.family_grouped else None}")
         print(f"  repeated random splits: mean={ge.repeated_random_splits.accuracy_mean} stddev={ge.repeated_random_splits.accuracy_stddev}")
+        if ge.near_duplicate_controlled_sweep:
+            print("  near-duplicate-controlled sweep (Phase 18, P0.1 -- descriptive, not causal):")
+            for row in ge.near_duplicate_controlled_sweep:
+                print(
+                    f"    {row.significant_digits}sf ({row.fraction_rows_in_multi_row_family:.2%} constrained): "
+                    f"acc={row.accuracy} CI=[{row.accuracy_ci.lower}, {row.accuracy_ci.upper}]"
+                )
 
     if report.reliability:
         rel = report.reliability

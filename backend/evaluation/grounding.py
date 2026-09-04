@@ -116,7 +116,7 @@ def is_supported(claim: str, context_words: set[str]) -> bool:
     return (overlap / len(claim_words)) >= _SUPPORT_THRESHOLD
 
 
-def _retrieved_context_text(query: str, primary_threat: str | None) -> str:
+def retrieved_context_text(query: str, primary_threat: str | None) -> str:
     relevant = retrieve_relevant(query, k=RAG_TOP_K, threshold=RAG_SCORE_THRESHOLD)
     if primary_threat is not None:
         relevant = [(doc, score) for doc, score in relevant if doc.metadata.get("threat_type") == primary_threat]
@@ -170,7 +170,7 @@ def run_grounding_evaluation(cases: list[tuple[str, str | None]] | None = None) 
             )
             continue
 
-        context_text = _retrieved_context_text(query, result.threat)
+        context_text = retrieved_context_text(query, result.threat)
         context_words = significant_words(context_text)
         context_sentences = _split_sentences(context_text)
 

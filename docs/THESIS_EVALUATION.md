@@ -91,13 +91,70 @@ this specific capture file that materially limits how much confidence the
 near-ceiling accuracy can support as a generalization claim.** It is **not** a proof
 that leakage caused the reported accuracy: no controlled experiment in this phase
 directly isolates "near-duplicate structure" as a variable and measures accuracy with
-it removed (the family-grouped split in §10/§16 is a step in that direction, but is
-itself a weak, low-power control — see §10). The correct, fully-supported conclusion
-is: *the near-duplicate structure is real, substantial, and undermines confidence in
-treating the reported accuracy as evidence of learned generalization to genuinely
-novel traffic* — not *the near-duplicate structure is proven to be the cause of the
-reported accuracy*. See §5 for the follow-up experiment this motivates, and §13 for
-how this shapes the internal-validity threat below.
+it removed (the sweep described immediately below is a step in that direction, but
+remains an observational comparison, not a causal one — see §14). The correct,
+fully-supported conclusion is: *the near-duplicate structure is real, substantial, and
+undermines confidence in treating the reported accuracy as evidence of learned
+generalization to genuinely novel traffic* — not *the near-duplicate structure is
+proven to be the cause of the reported accuracy*. See §13 for how this shapes the
+internal-validity threat below.
+
+### Phase 18 (P0.1): multi-granularity near-duplicate-controlled sweep
+
+The single 3-significant-figure family-grouped point above (only ~5.2% of rows
+constrained) was, on its own, too underpowered to distinguish "no effect" from "a
+test too weak to detect an effect." Phase 18 turns it into a **dose-response
+comparison** by repeating the identical family-grouped construction at 2, 3, and 4
+significant figures — the exact granularities `leakage_audit.py` already measured and
+disclosed (constraining ~17.6%, ~5.2%, and ~1.1% of rows respectively), not a newly
+invented parameter. A full radius-based nearest-neighbor connected-components
+grouping over the entire ~223k-row dataset was considered and rejected as
+computationally intractable (O(n²) pairwise distances at 78 dimensions); this
+rounding-based sweep is the strongest tractable, fully reproducible alternative
+buildable entirely from already-existing, already-audited code
+(`backend/evaluation/generalization_experiment.py::_near_duplicate_controlled_sweep()`).
+
+**The research question this sweep answers is deliberately the weaker, observational
+one:** *does measured accuracy change as progressively larger (but still minority)
+fractions of coordinate-similar row families are constrained to remain on one side of
+the split, and by roughly how much* — never *how much of the apparent classification
+performance is attributable to near-duplicate structure*, which no experiment in this
+phase can support causally (see the reasoning above: rounding-coordinate equality is a
+similarity proxy, not a verified session/flow identity, and this remains an
+observational comparison across split conditions rather than a controlled
+intervention with everything else held fixed). Results are in §14; the generated
+(never hand-typed) `dose_response_note` is checked by
+`tests/test_evaluation_generalization.py` to never contain causal language such as
+"proves," "causes," or "accounts for."
+
+**The correct interpretation of the sweep result is exactly:** *feature-family
+controls at 2, 3, and 4 significant figures did not materially reduce measured
+accuracy.* It is **not**: "near-duplicates do not cause leakage," "leakage has no
+effect," or "the model generalizes" — none of those are supported.
+
+**Reconciling this with the 1-NN evidence above — these two findings are not in
+tension, because they answer two different questions:**
+1. The near-duplicate 1-NN measurement (§4 table above) answers *"how similar are
+   test rows to their nearest training row?"* — and the answer is: very similar
+   (71.0% within 0.01 standardized distance). This finding stands on its own and is
+   unaffected by anything below.
+2. The P0.1 sweep answers a different question: *"does forcing coordinate-similar
+   row families to stay on one side of the split move measured accuracy?"* — and
+   the answer, at the three grouping strengths this heuristic can reach, is: not
+   measurably.
+3. These are compatible because the sweep's grouping proxy (coordinate-rounding
+   equality) is a much coarser, stricter notion of "similar" than the 1-NN distance
+   measurement — most of the near-duplicate structure the 1-NN measurement detects
+   (rows close in standardized Euclidean distance, but not coordinate-identical
+   after rounding) is **not** captured by the family-grouping heuristic at all, so
+   the sweep's null result does not, and cannot, retroactively explain away the 1-NN
+   finding. Substantial train/test similarity remains real; the current grouping
+   proxy simply does not demonstrate a *measurable accuracy penalty* under this
+   specific, limited-power operationalization of "grouped." A properly-powered test
+   would need to group by the same 1-NN-distance criterion itself (rejected above as
+   computationally intractable at this dataset's scale), not by coordinate-rounding
+   equality — so the sweep's null result is a statement about this heuristic's
+   power, not a rebuttal of the underlying similarity finding.
 
 ## 5. Retrieval evaluation methodology (RQ2)
 
@@ -167,6 +224,42 @@ architecture (see README). Two tiers, kept explicitly separate:
   single-author thesis; **no inter-rater reliability statistic can be computed or
   claimed** unless a second independent annotator is recruited — documented here as
   an explicit limitation, not silently assumed away.
+
+### Phase 18 (P0.2): annotation infrastructure
+
+The rubric template (`write_rubric_template()`) now also carries
+`retrieved_context_excerpt` (the actual retrieved evidence text a case's summary/
+attack_vectors were expected to be grounded in, re-fetched via
+`grounding.py::retrieved_context_text()`) and `is_negative_control`, so an annotator
+can judge each case against the real evidence in front of them rather than from
+memory or from re-running the query themselves. See
+[`docs/LLM_RUBRIC_ANNOTATION_GUIDE.md`](LLM_RUBRIC_ANNOTATION_GUIDE.md) for the full
+scoring instructions, worked examples, and negative-control handling.
+
+A new, separate module, `backend/evaluation/llm_rubric_scoring.py`, reads one or more
+humans' filled-in copies of the template and computes summary statistics —
+**infrastructure only, still no scores generated by this session**. It is
+deliberately not wired into `backend/evaluation/__main__.py`'s fully-automated
+`--llm`/`--full` flow, so the automated/human distinction stays structurally visible
+(a separate entry point, a separate output artifact), not just documented in prose.
+Run it directly once an annotation CSV exists:
+
+```bash
+uv run python -m backend.evaluation.llm_rubric_scoring evaluation/llm_rubric_annotations_<id>.csv
+```
+
+Validation rules (all tested, see `tests/test_evaluation_llm_rubric_scoring.py`): a
+blank score cell is `"unscored"` (excluded from the mean, never coerced to 0); a cell
+containing anything other than exactly `0`/`1`/`2` is `"invalid"` (excluded, logged
+with the original text); negative-control cases are **never** scored on any
+dimension, even if a stray score is accidentally present (excluded and logged, never
+silently counted). With exactly one annotator, `inter_rater` stays `None` and a
+`single_annotator_note` is always attached — **if that annotator is the thesis
+author, the note says so explicitly, since author-produced scores are not an
+independent quality judgment.** With two or more annotators, percent exact agreement
+and Cohen's weighted kappa (linear weights; `sklearn.metrics.cohen_kappa_score`, not
+hand-rolled) are reported per dimension — descriptive only, no significance test on
+kappa itself (5 on-topic cases does not justify one).
 
 ## 9. Grounding methodology and limitations (RQ4)
 
@@ -312,23 +405,36 @@ new in Phase 17:
 
 - **Table 1 (ML performance):** unchanged from Phase 16, now with a Wilson 95% CI on
   held-out accuracy: **[0.999769, 0.999965]**.
-- **Table 2 (leakage/generalization) — new:** the leakage audit (§4) plus a
-  research-only family-grouped-split retrain: accuracy **0.999888** vs. baseline
-  **0.999910** — nearly identical, but this comparison has limited power since only
-  ~5.2% of rows fall into a multi-row family at the grouping precision used (see §16
-  for why this doesn't contradict §4's stronger finding). 5-seed repeated-random-split
-  variance: mean 0.999910, stddev 0.000045 — confirms the reported number isn't a
-  lucky single seed.
+- **Table 2 (leakage/generalization) — extended in Phase 18 (P0.1):** the leakage
+  audit (§4) plus a research-only multi-granularity sweep. Baseline accuracy
+  **0.999910** (95% CI [0.999769, 0.999965]) vs. the sweep: **2sf** (17.56% of rows
+  constrained) accuracy **0.999910** (CI [0.999769, 0.999965]); **3sf** (5.23%
+  constrained, the original Phase 17 point) accuracy **0.999888** (CI [0.999738,
+  0.999952]); **4sf** (1.09% constrained) accuracy **0.999910** (CI [0.999769,
+  0.999965]). Descriptively: accuracy is effectively unchanged between the strongest
+  and weakest tested grouping constraints, and their 95% CIs overlap — see §4's
+  explicit statement of what this observational comparison does and does not
+  establish (it is not a causal test, and even the strongest tested condition still
+  leaves ~82% of rows unconstrained). 5-seed repeated-random-split variance: mean
+  0.999910, stddev 0.000045 — confirms the reported number isn't a lucky single
+  seed.
 - **Table 3 (retrieval) — expanded:** 25 queries now (was 15); Recall@5 = 0.9467,
   Precision@5 = 0.528, with a bootstrap 95% CI of [0.88, 1.00].
 - **Table 4 (hybrid) — extended:** relevance_delta confirmed exactly 0.0 at every k
   on the larger query set; new downstream-usefulness result (§7): mitigations gained
   in 40% of cases when graph evidence was present.
 - **Table 5 (LLM) — extended:** automated metrics unchanged (all 1.0); grounding now
-  reports both lexical (1.0) and semantic (1.0) proxies.
+  reports both lexical (1.0) and semantic (1.0) proxies. Phase 18 (P0.2) shipped the
+  human-rubric annotation infrastructure (enriched template with retrieved evidence,
+  `llm_rubric_scoring.py`, the annotation guide) but **did not generate any human
+  scores** — rubric dimensions remain IMPLEMENTED / NOT YET MEASURED until a human
+  actually annotates `evaluation/llm_rubric_template.csv`.
 - **Table 6 (latency) — new reliability data:** 20/20 repeated end-to-end runs
-  succeeded (success rate 1.0); total latency mean 5632ms, stddev 216ms, p95 6039ms.
-  Per-stage `stddev_ms` now reported alongside mean/p50/p95/min/max.
+  succeeded (success rate 1.0); total latency mean 3384.6ms, stddev 196.7ms, p95
+  3586.3ms (corrected post Phase 17.1's self-audit, which found and fixed a
+  measurement-boundary bug that had been double-counting the LLM call and inflating
+  this figure to ~5632ms — see the Phase 17.1 turn's report for the fix). Per-stage
+  `stddev_ms` now reported alongside mean/p50/p95/min/max.
 - **Table 7 (ablation) — new:** progressive latency/evidence cost across the four
   conditions, confirming the LLM stage dominates end-to-end cost by roughly two
   orders of magnitude, consistent with Phase 16's finding.

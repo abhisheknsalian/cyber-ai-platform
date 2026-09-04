@@ -61,13 +61,19 @@ def test_rubric_dimensions_are_unscored_until_annotated(tmp_path):
 
 
 def test_rubric_template_is_written_with_one_row_per_case(tmp_path):
+    import csv as csv_module
+
     output = tmp_path / "rubric.csv"
     with patch("backend.services.threat_analysis.generate_analysis_fragment", return_value=_FRAGMENT):
         report = run_llm_evaluation(_CASES, rubric_template_path=output)
 
     assert report.rubric_template_path == str(output)
     assert output.exists()
-    rows = output.read_text(encoding="utf-8").strip().splitlines()
+    # csv.reader (not naive splitlines()) -- retrieved_context_excerpt can contain
+    # embedded newlines inside a properly-quoted CSV field, which splitlines() would
+    # miscount as multiple rows.
+    with output.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv_module.reader(handle))
     assert len(rows) == 1 + len(_CASES)  # header + one row per case
 
 
@@ -77,14 +83,18 @@ def test_write_rubric_template_header_has_only_the_documented_columns(tmp_path):
     model output."""
     import csv as csv_module
 
-    rows = [{"case_id": 0, "query": "q", "category": "phishing", "severity": "High", "summary": "s", "attack_vectors": "a"}]
+    rows = [{
+        "case_id": 0, "query": "q", "category": "phishing", "severity": "High", "summary": "s",
+        "attack_vectors": "a", "retrieved_context_excerpt": "ctx", "is_negative_control": False,
+    }]
     output = tmp_path / "rubric.csv"
     write_rubric_template(rows, output)
 
     with output.open(newline="", encoding="utf-8") as handle:
         header = next(csv_module.reader(handle))
     assert "case_id" in header and "query" in header and "category" in header
-    assert len(header) == 6 + 3  # 6 case fields + 3 rubric-dimension score columns
+    assert "retrieved_context_excerpt" in header and "is_negative_control" in header
+    assert len(header) == 8 + 3  # 8 case fields (incl. retrieved evidence + negative-control flag) + 3 rubric-dimension score columns
 
 
 def test_schema_invalid_response_excluded_from_valid_rate_not_crashed(tmp_path):

@@ -340,6 +340,26 @@ class LLMAutomatedMetrics(BaseModel):
     severity_present_rate: float  # among "analyzed" cases
 
 
+class RubricCaseScore(BaseModel):
+    """Phase 18 (P0.2): one annotator's score for one case on one rubric dimension.
+    Deliberately distinguishes three states that must never be collapsed into each
+    other: a blank cell (`"unscored"`, e.g. not-yet-annotated by the time of
+    reading), a cell containing something other than 0/1/2 (`"invalid"` -- reported,
+    excluded, never coerced to a number), and a genuine 0/1/2 value (`"valid"`,
+    the only status with `value` set). See
+    backend/evaluation/llm_rubric_scoring.py::parse_annotation_csv()."""
+
+    case_id: int
+    status: Literal["unscored", "valid", "invalid"]
+    value: int | None = None  # 0, 1, or 2 -- set only when status == "valid"
+    raw_value: str | None = None  # the original cell text, kept for "invalid" entries as an audit trail
+    # None when there is exactly one annotator (the common case); set to that
+    # annotator's id when 2+ annotators' CSVs were scored together, so per-annotator
+    # scores for the same case_id can coexist in one dimension's `scores` list
+    # without one silently overwriting the other.
+    annotator_id: str | None = None
+
+
 class LLMRubricDimension(BaseModel):
     """A dimension that genuinely requires human judgment. `scores` is empty until a
     human annotator fills in the CSV/JSON template this module writes -- see
@@ -348,9 +368,63 @@ class LLMRubricDimension(BaseModel):
     name: str
     description: str
     scale_description: str  # e.g. "0=incorrect, 1=partially correct, 2=correct"
-    status: Literal["not_yet_annotated", "annotated"]
+    # Phase 18 (P0.2) adds "partially_annotated" -- some but not all on-topic cases
+    # scored. "annotated" is reserved for every on-topic case having a valid score.
+    status: Literal["not_yet_annotated", "partially_annotated", "annotated"]
     mean_score: float | None = None
-    scores: list[int] = Field(default_factory=list)
+    # Phase 18 (P0.2): was list[int] (Phase 16) -- now case-linked, and able to
+    # represent unscored/invalid entries explicitly rather than only ever holding
+    # already-valid integers. A deliberate, documented breaking type change (see
+    # Phase 18 turn's final report), not a silently-compatible extension.
+    scores: list[RubricCaseScore] = Field(default_factory=list)
+    # Counts over on-topic cases only -- negative controls are never scored on any
+    # rubric dimension (see llm_rubric_scoring.py).
+    valid_count: int = 0
+    invalid_count: int = 0
+    unscored_count: int = 0
+    on_topic_case_count: int = 0
+
+
+class InterRaterAgreementReport(BaseModel):
+    """Phase 18 (P0.2): populated ONLY when 2+ annotators' filled CSVs were
+    actually supplied to score_annotations() -- never fabricated, never inferred
+    from a single annotator. See llm_rubric_scoring.py."""
+
+    annotator_ids: list[str]
+    dimension: str
+    cases_compared: int
+    percent_exact_agreement: float
+    # None (not NaN, never fabricated) when kappa is mathematically undefined -- the
+    # degenerate case where both annotators gave the same constant score on every
+    # compared case, so there is zero variance to explain and Cohen's kappa's
+    # "agreement beyond chance" correction divides by zero. percent_exact_agreement
+    # (well-defined, 1.0 in that case) is still reported. See
+    # llm_rubric_scoring.py::_inter_rater_for_dimension().
+    cohens_weighted_kappa: float | None
+    note: str
+
+
+class LLMRubricAnnotationSummary(BaseModel):
+    """Phase 18 (P0.2): the result of scoring one or more humans' filled-in copies
+    of the rubric template -- a SEPARATE artifact from LLMEvaluationReport (which
+    backend/evaluation/__main__.py's fully-automated --llm flow produces without
+    any human input) so the automated/human distinction stays structurally visible,
+    not just documented in prose. Never produced by the automated evaluation
+    pipeline; only by backend/evaluation/llm_rubric_scoring.py, which requires a
+    human-authored CSV file to already exist on disk."""
+
+    annotator_ids: list[str]
+    on_topic_case_count: int
+    negative_control_case_count: int
+    dimensions: list[LLMRubricDimension]
+    # None (not a fabricated agreement value) unless 2+ annotators were supplied.
+    inter_rater: list[InterRaterAgreementReport] | None = None
+    single_annotator_note: str | None = None
+    # Human-readable audit trail of any row this scoring run excluded and why
+    # (invalid score text, a case_id not found among the known cases, a
+    # negative-control row that carried a stray score, etc.) -- never silent.
+    excluded_rows: list[str] = Field(default_factory=list)
+    methodology_note: str
 
 
 class LLMEvaluationReport(BaseModel):
@@ -495,6 +569,12 @@ class SplitEvaluationResult(BaseModel):
     # artifact's split; every other row here is a research-only model, never saved
     # over models/ddos_random_forest.joblib.
     is_production_artifact: bool
+    # Phase 18 (P0.1): additive, optional -- populated only for rounding-based
+    # near-duplicate-controlled conditions (see
+    # generalization_experiment.py::_near_duplicate_controlled_sweep()). None for
+    # baseline/repeated-split conditions, which aren't grouping-based at all.
+    significant_digits: int | None = None
+    fraction_rows_in_multi_row_family: float | None = None
 
 
 class RepeatedSplitVarianceReport(BaseModel):
@@ -514,6 +594,18 @@ class GeneralizationExperimentReport(BaseModel):
     repeated_random_splits: RepeatedSplitVarianceReport
     methodology_note: str
     limitations: list[str]
+    # Phase 18 (P0.1): multi-granularity near-duplicate-controlled sweep --
+    # additive, optional field so existing consumers of family_grouped (the single
+    # 3-significant-figure condition) are unaffected. Contains one
+    # SplitEvaluationResult per swept significant_digits value (2, 3, 4); the 3sf
+    # entry here is computed identically to (but is a SEPARATE object instance
+    # from) `family_grouped` above -- both are kept for backward compatibility, see
+    # generalization_experiment.py's module docstring.
+    near_duplicate_controlled_sweep: list[SplitEvaluationResult] | None = None
+    # Generated, descriptive-only interpretation of the sweep -- never causal
+    # language ("proves"/"caused by"/"accounts for"). See
+    # generalization_experiment.py::_dose_response_note().
+    dose_response_note: str | None = None
 
 
 # --- Phase 17, RQ5: end-to-end reliability (repeated real pipeline runs) -----------
