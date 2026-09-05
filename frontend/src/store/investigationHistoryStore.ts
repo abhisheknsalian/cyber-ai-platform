@@ -4,6 +4,7 @@ import { persist } from "zustand/middleware";
 import {
   ApiError,
   createInvestigation,
+  deleteInvestigation as apiDeleteInvestigation,
   getInvestigation,
   listInvestigations,
   saveAnalysisResult,
@@ -83,10 +84,28 @@ interface InvestigationHistoryState {
   activeClassificationResultId: number | null;
   activeAnalysisSaved: boolean;
 
+  /** The investigation currently being deleted, or null. Used both to show a
+   * per-row loading state and to reject a second delete call for the same id while
+   * the first request is still in flight (the confirm button is also disabled
+   * client-side, but this guards against any other trigger, e.g. a fast double
+   * Enter-key confirm). */
+  deletingId: number | null;
+  deleteError: string | null;
+
   loadHistory: (limit?: number, offset?: number) => Promise<void>;
   selectInvestigation: (id: number) => Promise<void>;
   clearSelection: () => void;
   saveCurrent: (params: SaveCurrentParams) => Promise<void>;
+  /** Deletes a saved investigation server-side, then removes it from `investigations`
+   * and decrements `total` -- callers re-fetching isn't necessary for this to stay
+   * correct. If the deleted investigation was `selectedInvestigation`, clears the
+   * selection (there is nothing left to show). If the deleted investigation was the
+   * one the unsaved Network Detection draft currently points at (activeInvestigationId),
+   * resets just that pointer (via resetActiveInvestigation) so "Save Investigation"
+   * creates a fresh one instead of writing to an id that no longer exists -- this
+   * does NOT touch the draft's actual content (networkDetectionStore.ts), which is a
+   * separate, unrelated store and must survive deleting an investigation. */
+  deleteInvestigation: (id: number) => Promise<void>;
   /** Call when a NEW classification has just been run within the same investigation
    * (re-running /classify without starting a fresh investigation) -- clears only the
    * classification/analysis save state, keeping activeInvestigationId so the next
@@ -123,6 +142,9 @@ const INITIAL_STATE = {
   activeInvestigationId: null as number | null,
   activeClassificationResultId: null as number | null,
   activeAnalysisSaved: false,
+
+  deletingId: null as number | null,
+  deleteError: null as string | null,
 };
 
 export const useInvestigationHistoryStore = create<InvestigationHistoryState>()(
@@ -182,6 +204,30 @@ export const useInvestigationHistoryStore = create<InvestigationHistoryState>()(
           set({ saveStatus: "saved" });
         } catch (error) {
           set({ saveStatus: "error", saveError: errorMessage(error) });
+        }
+      },
+
+      async deleteInvestigation(id) {
+        if (get().deletingId !== null) return;
+        set({ deletingId: id, deleteError: null });
+        try {
+          await apiDeleteInvestigation(id);
+
+          set((state) => ({
+            investigations: state.investigations.filter((investigation) => investigation.id !== id),
+            total: Math.max(0, state.total - 1),
+            selectedInvestigation: state.selectedInvestigation?.id === id ? null : state.selectedInvestigation,
+            detailStatus: state.selectedInvestigation?.id === id ? "idle" : state.detailStatus,
+            detailError: state.selectedInvestigation?.id === id ? null : state.detailError,
+            deletingId: null,
+            deleteError: null,
+          }));
+
+          if (get().activeInvestigationId === id) {
+            get().resetActiveInvestigation();
+          }
+        } catch (error) {
+          set({ deletingId: null, deleteError: errorMessage(error) });
         }
       },
 

@@ -1,4 +1,4 @@
-import { ArrowLeft, ChevronLeft, ChevronRight, History, Radar } from "lucide-react";
+import { ArrowLeft, ChevronLeft, ChevronRight, History, Radar, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -6,6 +6,7 @@ import { AnalysisResult } from "../components/analysis/AnalysisResult";
 import { ErrorState } from "../components/analysis/ErrorState";
 import { LoadingState } from "../components/analysis/LoadingState";
 import { Card } from "../components/common/Card";
+import { ConfirmDialog } from "../components/common/ConfirmDialog";
 import { PageHeader } from "../components/common/PageHeader";
 import { StatusPill } from "../components/common/StatusPill";
 import { useAuth } from "../context/AuthContext";
@@ -63,17 +64,40 @@ export function InvestigationsPage() {
     selectedInvestigation,
     detailStatus,
     detailError,
+    deletingId,
+    deleteError,
     loadHistory,
     selectInvestigation,
     clearSelection,
+    deleteInvestigation,
   } = useInvestigationHistoryStore();
 
   const [offset, setOffset] = useState(0);
+  // Which investigation the confirmation dialog is currently open for -- separate
+  // from `deletingId` (the store's in-flight tracker) so the dialog stays mounted
+  // while the request is pending and can show its own "Deleting..." state.
+  const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
 
   useEffect(() => {
     if (canView) loadHistory(PAGE_SIZE, offset);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canView, offset]);
+
+  // Deleting the last remaining investigation on a page beyond the first would
+  // otherwise strand the view on a now-empty page with an enabled "Previous" button
+  // -- step back a page instead of re-fetching (loadHistory's own effect above
+  // handles the re-fetch once `offset` changes).
+  useEffect(() => {
+    if (historyStatus === "success" && investigations.length === 0 && offset > 0) {
+      setOffset((value) => Math.max(0, value - PAGE_SIZE));
+    }
+  }, [historyStatus, investigations.length, offset]);
+
+  async function handleConfirmDelete() {
+    if (pendingDeleteId === null) return;
+    await deleteInvestigation(pendingDeleteId);
+    setPendingDeleteId(null);
+  }
 
   if (!canView) {
     return (
@@ -101,17 +125,29 @@ export function InvestigationsPage() {
             selectedInvestigation.updated_at,
           )}`}
           status={
-            <button
-              type="button"
-              onClick={clearSelection}
-              className="flex items-center gap-1.5 rounded border border-border-strong px-2.5 py-1 text-[11px] font-medium text-text-muted transition-colors hover:border-accent/50 hover:text-text"
-            >
-              <ArrowLeft className="h-3 w-3" strokeWidth={1.75} />
-              Back to Investigations
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={clearSelection}
+                className="flex items-center gap-1.5 rounded border border-border-strong px-2.5 py-1 text-[11px] font-medium text-text-muted transition-colors hover:border-accent/50 hover:text-text"
+              >
+                <ArrowLeft className="h-3 w-3" strokeWidth={1.75} />
+                Back to Investigations
+              </button>
+              <button
+                type="button"
+                onClick={() => setPendingDeleteId(selectedInvestigation.id)}
+                disabled={deletingId === selectedInvestigation.id}
+                className="flex items-center gap-1.5 rounded border border-malicious/30 px-2.5 py-1 text-[11px] font-medium text-malicious-strong transition-colors hover:border-malicious/60 hover:bg-malicious/5 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Trash2 className="h-3 w-3" strokeWidth={1.75} />
+                Delete
+              </button>
+            </div>
           }
         />
 
+        {deleteError && <ErrorState message={deleteError} />}
         {detailStatus === "loading" && <LoadingState />}
         {detailStatus === "error" && detailError && <ErrorState message={detailError} />}
 
@@ -124,6 +160,17 @@ export function InvestigationsPage() {
             ))
           )}
         </div>
+
+        {pendingDeleteId !== null && (
+          <ConfirmDialog
+            title="Delete investigation?"
+            description="This will permanently delete this saved investigation and its analysis history. This action cannot be undone."
+            confirmLabel="Delete Investigation"
+            pending={deletingId === pendingDeleteId}
+            onConfirm={handleConfirmDelete}
+            onCancel={() => setPendingDeleteId(null)}
+          />
+        )}
       </div>
     );
   }
@@ -136,6 +183,7 @@ export function InvestigationsPage() {
         description="Persistent, per-account history of Network Detection classifications and their AI analysis."
       />
 
+      {deleteError && <ErrorState message={deleteError} />}
       {historyStatus === "loading" && <LoadingState />}
       {historyStatus === "error" && historyError && <ErrorState message={historyError} />}
 
@@ -162,15 +210,15 @@ export function InvestigationsPage() {
             const latest = investigation.latest_classification;
             const malicious = latest?.classification === "malicious";
             return (
-              <button
+              <Card
                 key={investigation.id}
-                type="button"
-                onClick={() => selectInvestigation(investigation.id)}
-                className="block w-full text-left"
+                glow={latest ? (malicious ? "malicious" : "benign") : "none"}
+                className="flex flex-wrap items-center justify-between gap-3 p-4 transition-transform duration-150 hover:-translate-y-0.5"
               >
-                <Card
-                  glow={latest ? (malicious ? "malicious" : "benign") : "none"}
-                  className="flex flex-wrap items-center justify-between gap-3 p-4 transition-transform duration-150 hover:-translate-y-0.5"
+                <button
+                  type="button"
+                  onClick={() => selectInvestigation(investigation.id)}
+                  className="flex flex-1 flex-wrap items-center justify-between gap-3 text-left"
                 >
                   <div>
                     <p className="text-sm font-medium text-text">
@@ -199,8 +247,17 @@ export function InvestigationsPage() {
                   ) : (
                     <span className="font-mono text-[11px] text-text-faint">No classification yet</span>
                   )}
-                </Card>
-              </button>
+                </button>
+                <button
+                  type="button"
+                  aria-label={`Delete ${investigation.label ?? `Investigation #${investigation.id}`}`}
+                  onClick={() => setPendingDeleteId(investigation.id)}
+                  disabled={deletingId === investigation.id}
+                  className="shrink-0 rounded border border-transparent p-1.5 text-text-faint transition-colors hover:border-malicious/30 hover:bg-malicious/5 hover:text-malicious-strong disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Trash2 className="h-3.5 w-3.5" strokeWidth={1.75} />
+                </button>
+              </Card>
             );
           })}
         </div>
@@ -231,6 +288,17 @@ export function InvestigationsPage() {
           </button>
         </div>
       ) : null}
+
+      {pendingDeleteId !== null && (
+        <ConfirmDialog
+          title="Delete investigation?"
+          description="This will permanently delete this saved investigation and its analysis history. This action cannot be undone."
+          confirmLabel="Delete Investigation"
+          pending={deletingId === pendingDeleteId}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setPendingDeleteId(null)}
+        />
+      )}
     </div>
   );
 }

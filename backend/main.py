@@ -626,6 +626,23 @@ def create_analysis_result(
     return result
 
 
+@app.delete("/investigations/{investigation_id}", status_code=204)
+def delete_investigation(
+    investigation_id: int,
+    user_id: int = Depends(require_user_id),
+) -> None:
+    """Permanently deletes an investigation and its classification/analysis history.
+    Session-user-only like every other route in this section (require_user_id) --
+    an API-key request or a demo session never reaches this far, see that
+    dependency's docstring. 404 for both a nonexistent id and one owned by someone
+    else (backend/services/investigations.py::delete_investigation() never
+    distinguishes the two, same as every other lookup in that module)."""
+    deleted = investigations_service.delete_investigation(user_id, investigation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Investigation not found.")
+    return None
+
+
 # --- Error response envelope -------------------------------------------------
 #
 # All three handlers below add a `request_id` field alongside the existing `detail`

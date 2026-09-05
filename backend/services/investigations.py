@@ -389,3 +389,53 @@ def add_analysis_result(
     metrics.increment("investigation_persistence_total", operation="persist_analysis_result", outcome="success")
     metrics.observe_duration_ms("investigation_persistence", duration_ms, operation="persist_analysis_result")
     return result
+
+
+def delete_investigation(user_id: int, investigation_id: int) -> bool:
+    """Deletes an investigation and everything under it (classification_results,
+    and each one's analysis_result) in one transaction. Returns False if
+    `investigation_id` doesn't exist or isn't owned by `user_id` (caller raises 404)
+    -- exactly the same ownership-scoped lookup every other function in this module
+    uses (_owned_investigation(), never "fetch by id, then compare ownership"), so a
+    nonexistent id and another user's id are indistinguishable here too.
+
+    Cascading deletion is enforced twice, independently: `Investigation.
+    classification_results` (and `ClassificationRecord.analysis_result`) both carry
+    `cascade="all, delete-orphan"` at the ORM level (backend/db/models.py), and every
+    child foreign key is also `ondelete="CASCADE"` at the database level (enforced on
+    SQLite via backend/db/session.py's PRAGMA foreign_keys=ON listener, natively on
+    PostgreSQL) -- deleting the ORM instance below triggers both. Only this one
+    investigation's own rows are ever touched: the ownership-scoped SELECT above
+    guarantees `investigation` is the exact row requested, and the cascade only
+    follows *its* foreign keys, never a sibling investigation's or another user's."""
+    start = time.perf_counter()
+    with session_scope() as db:
+        investigation = _owned_investigation(db, user_id, investigation_id)
+        if investigation is None:
+            logger.warning(
+                "Investigation not found or not owned by requesting user",
+                extra={
+                    "event": "investigation_access_denied",
+                    "user_id": user_id,
+                    "investigation_id": investigation_id,
+                },
+            )
+            metrics.increment("investigation_persistence_total", operation="delete_investigation", outcome="denied")
+            return False
+
+        db.delete(investigation)
+
+    duration_ms = _duration_ms(start)
+    logger.info(
+        "Investigation deleted",
+        extra={
+            "event": "investigation_deleted",
+            "user_id": user_id,
+            "investigation_id": investigation_id,
+            "duration_ms": duration_ms,
+            "success": True,
+        },
+    )
+    metrics.increment("investigation_persistence_total", operation="delete_investigation", outcome="success")
+    metrics.observe_duration_ms("investigation_persistence", duration_ms, operation="delete_investigation")
+    return True

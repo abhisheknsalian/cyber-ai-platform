@@ -147,6 +147,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(detail, response.status, requestId);
   }
 
+  // DELETE /investigations/{id} (the only 204 route in this API) has no body --
+  // parsing it as JSON would throw.
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
   try {
     return (await response.json()) as T;
   } catch {
@@ -229,6 +235,10 @@ export function listInvestigations(limit = 20, offset = 0): Promise<Investigatio
 
 export function getInvestigation(investigationId: number): Promise<InvestigationDetail> {
   return request<InvestigationDetail>(`/investigations/${investigationId}`);
+}
+
+export function deleteInvestigation(investigationId: number): Promise<void> {
+  return request<void>(`/investigations/${investigationId}`, { method: "DELETE" });
 }
 
 export function saveClassificationResult(

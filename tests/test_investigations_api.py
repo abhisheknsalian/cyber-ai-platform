@@ -476,3 +476,117 @@ def test_registration_and_investigation_credentials_never_appear_in_logs(client,
 
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     assert "correct-horse-1" not in log_text
+
+
+# ---------------------------------------------------------------------------
+# 25. DELETE /investigations/{id}
+# ---------------------------------------------------------------------------
+
+
+def test_delete_investigation_without_auth_rejected(client):
+    other = _registered_client("alice")
+    investigation_id = _create_investigation(other)
+    response = client.delete(f"/investigations/{investigation_id}")
+    assert response.status_code == 401
+
+
+def test_delete_investigation_with_api_key_only_rejected(client, monkeypatch):
+    monkeypatch.setenv("CYBER_AI_API_KEY", "test-only-key-never-a-real-secret")
+    other = _registered_client("alice")
+    investigation_id = _create_investigation(other)
+    response = client.delete(
+        f"/investigations/{investigation_id}",
+        headers={"Authorization": "Bearer test-only-key-never-a-real-secret"},
+    )
+    assert response.status_code == 401
+
+
+def test_delete_investigation_with_demo_session_rejected_403(client, monkeypatch):
+    monkeypatch.setenv("CYBER_AI_USERNAME", "demo-operator")
+    monkeypatch.setenv("CYBER_AI_PASSWORD", "demo-password-only-for-tests")
+    other = _registered_client("alice")
+    investigation_id = _create_investigation(other)
+
+    _login(client, "demo-operator", "demo-password-only-for-tests")
+    response = client.delete(f"/investigations/{investigation_id}", headers=_csrf_header(client))
+    assert response.status_code == 403
+
+
+def test_delete_investigation_owner_succeeds(client):
+    _register(client, "alice")
+    _login(client, "alice")
+    investigation_id = _create_investigation(client)
+
+    response = client.delete(f"/investigations/{investigation_id}", headers=_csrf_header(client))
+    assert response.status_code == 204
+    assert response.content == b""
+
+    assert client.get(f"/investigations/{investigation_id}").status_code == 404
+
+
+def test_delete_investigation_other_user_returns_404(client):
+    other = _registered_client("bob")
+    other_investigation_id = _create_investigation(other)
+
+    _register(client, "alice")
+    _login(client, "alice")
+    response = client.delete(f"/investigations/{other_investigation_id}", headers=_csrf_header(client))
+    assert response.status_code == 404
+
+    # Denied cross-user delete must not have touched Bob's row.
+    with session_scope() as db:
+        assert db.query(Investigation).filter_by(id=other_investigation_id).count() == 1
+
+
+def test_delete_nonexistent_investigation_returns_404(client):
+    _register(client, "alice")
+    _login(client, "alice")
+    response = client.delete("/investigations/999999", headers=_csrf_header(client))
+    assert response.status_code == 404
+
+
+def test_deleting_investigation_removes_dependent_records(client):
+    _register(client, "alice")
+    _login(client, "alice")
+    investigation_id = _create_investigation(client)
+    result_id = _post_classification(client, investigation_id).json()["id"]
+    _post_analysis(client, investigation_id, result_id)
+
+    response = client.delete(f"/investigations/{investigation_id}", headers=_csrf_header(client))
+    assert response.status_code == 204
+
+    with session_scope() as db:
+        assert db.query(Investigation).filter_by(id=investigation_id).count() == 0
+        assert db.query(ClassificationRecord).filter_by(id=result_id).count() == 0
+        assert db.query(AnalysisRecord).filter_by(classification_result_id=result_id).count() == 0
+
+
+def test_deleting_one_investigation_does_not_affect_another(client):
+    _register(client, "alice")
+    _login(client, "alice")
+    keep_id = _create_investigation(client, "Keep me")
+    delete_id = _create_investigation(client, "Delete me")
+
+    response = client.delete(f"/investigations/{delete_id}", headers=_csrf_header(client))
+    assert response.status_code == 204
+
+    assert client.get(f"/investigations/{keep_id}").status_code == 200
+    remaining = client.get("/investigations").json()
+    assert remaining["total"] == 1
+    assert [item["id"] for item in remaining["items"]] == [keep_id]
+
+
+def test_deleting_investigation_does_not_affect_other_users_data(client):
+    other = _registered_client("bob")
+    other_investigation_id = _create_investigation(other, "Bob's investigation")
+
+    _register(client, "alice")
+    _login(client, "alice")
+    alice_investigation_id = _create_investigation(client, "Alice's investigation")
+
+    response = client.delete(f"/investigations/{alice_investigation_id}", headers=_csrf_header(client))
+    assert response.status_code == 204
+
+    bob_list = other.get("/investigations").json()
+    assert bob_list["total"] == 1
+    assert [item["id"] for item in bob_list["items"]] == [other_investigation_id]
