@@ -8,7 +8,23 @@ import {
   register as apiRegister,
   UNAUTHORIZED_EVENT,
 } from "../services/api";
+import { useInvestigationHistoryStore } from "../store/investigationHistoryStore";
+import { useNetworkDetectionStore } from "../store/networkDetectionStore";
 import type { LoginRequest, RegisterRequest, UserPublic } from "../types/auth";
+
+/** Clears every piece of per-user client state this app keeps outside the server --
+ * the in-progress Network Detection draft (networkDetectionStore, persisted to
+ * localStorage under a GLOBAL key, not scoped per-user) and the investigation
+ * history/selection/active-save-state (investigationHistoryStore). Without this, a
+ * different user signing in on the same browser -- including a demo session -- could
+ * see the previous user's unsaved classification and AI-generated threat analysis
+ * (product audit P1-1), and the active-save-state could point at a previous user's
+ * investigation ids. Called on every logout and whenever any request comes back 401,
+ * so a session that expires mid-use is cleared the same way an explicit logout is. */
+function clearPerUserClientState() {
+  useNetworkDetectionStore.getState().clearInvestigation();
+  useInvestigationHistoryStore.getState().resetAll();
+}
 
 interface AuthContextValue {
   /** True once the initial GET /auth/me check has completed (success or failure) --
@@ -56,6 +72,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setAuthenticated(false);
       setUsername(null);
       setUserId(null);
+      clearPerUserClientState();
     }
 
     window.addEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
@@ -72,6 +89,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setAuthenticated(status.authenticated);
     setUsername(status.username);
     setUserId(status.user_id);
+    // Also clear here, not just on logout/401: a browser closed (not explicitly
+    // logged out of) before a previous session's cookie expired would otherwise
+    // leave that session's client-only state sitting in localStorage for whoever
+    // logs in next -- establishing a NEW authenticated identity always starts clean,
+    // regardless of how the previous one ended.
+    clearPerUserClientState();
   }
 
   async function logout() {
@@ -83,6 +106,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setAuthenticated(false);
       setUsername(null);
       setUserId(null);
+      clearPerUserClientState();
     }
   }
 

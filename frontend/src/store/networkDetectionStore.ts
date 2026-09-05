@@ -1,7 +1,7 @@
 import { create } from "zustand";
-import type { PersistStorage, StorageValue } from "zustand/middleware";
 import { persist } from "zustand/middleware";
 
+import { createSafeStorage } from "./safeLocalStorage";
 import type { ThreatAnalysis } from "../types/api";
 import type { HybridEvidence } from "../types/intelligence";
 import type { ClassificationAnalysisResponse, ClassificationResult, NetworkTrafficFeatures } from "../types/ml";
@@ -71,55 +71,7 @@ function isPersistedShape(value: unknown): value is PersistedShape {
   );
 }
 
-/** Wraps localStorage so a corrupted/foreign value at this key can never crash the
- * app: JSON.parse failures and any read/write error (private browsing, quota,
- * disabled storage) are swallowed and treated as "nothing persisted". A value that
- * parses but doesn't look like our shape is dropped the same way, and the bad key is
- * proactively removed so it doesn't keep failing on every load. */
-const safeStorage: PersistStorage<PersistedShape> = {
-  getItem: (name) => {
-    let raw: string | null;
-    try {
-      raw = localStorage.getItem(name);
-    } catch {
-      return null;
-    }
-    if (!raw) return null;
-
-    try {
-      const parsed = JSON.parse(raw) as StorageValue<PersistedShape>;
-      if (typeof parsed !== "object" || parsed === null || !("state" in parsed)) {
-        throw new Error("malformed persisted value");
-      }
-      if (!isPersistedShape(parsed.state)) {
-        throw new Error("persisted state does not match the expected shape");
-      }
-      return parsed;
-    } catch {
-      try {
-        localStorage.removeItem(name);
-      } catch {
-        // Storage is unavailable entirely -- nothing more we can do.
-      }
-      return null;
-    }
-  },
-  setItem: (name, value) => {
-    try {
-      localStorage.setItem(name, JSON.stringify(value));
-    } catch {
-      // Quota exceeded / storage disabled -- the investigation simply won't survive
-      // a reload this time. Not fatal to the running app.
-    }
-  },
-  removeItem: (name) => {
-    try {
-      localStorage.removeItem(name);
-    } catch {
-      // Nothing more we can do.
-    }
-  },
-};
+const safeStorage = createSafeStorage(isPersistedShape);
 
 export const useNetworkDetectionStore = create<NetworkDetectionState>()(
   persist(
