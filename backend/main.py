@@ -126,7 +126,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    # DELETE added for DELETE /investigations/{id} (Phase 14 follow-up) -- without
+    # it, the browser's CORS preflight (OPTIONS) for that route is rejected before
+    # the actual DELETE request is ever sent, regardless of how the route itself
+    # authenticates or authorizes the request.
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "Authorization", "X-CSRF-Token"],
     # Phase 15: without this, browser JS cannot read the X-Request-ID response
     # header on a cross-origin response (only a small CORS-safelisted set of

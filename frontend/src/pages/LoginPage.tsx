@@ -1,7 +1,7 @@
 import { ShieldHalf } from "lucide-react";
 import { useState } from "react";
 import type { FormEvent } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 
 import { Card } from "../components/common/Card";
 import { useAuth } from "../context/AuthContext";
@@ -9,6 +9,7 @@ import { ApiError } from "../services/api";
 
 export function LoginPage() {
   const { login } = useAuth();
+  const navigate = useNavigate();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -20,6 +21,13 @@ export function LoginPage() {
     setSubmitting(true);
     try {
       await login({ username, password });
+      // AuthGate (App.tsx) swaps to an entirely different <Routes> table the
+      // instant `authenticated` flips true, and that table has no /login or
+      // /register entry (and no catch-all) -- without this, a login submitted
+      // from either URL leaves the authenticated shell rendering a blank content
+      // pane until the user manually clicks a sidebar link. Dashboard ("/") is
+      // always a valid route in that table, so it's a safe unconditional target.
+      navigate("/", { replace: true });
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "An unexpected error occurred.");
     } finally {

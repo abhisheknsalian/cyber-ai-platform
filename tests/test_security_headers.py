@@ -67,6 +67,37 @@ def test_cors_is_not_weakened_by_security_headers():
     assert "access-control-allow-origin" not in {h.lower() for h in response.headers}
 
 
+def test_cors_preflight_allows_delete_for_investigations_from_allowed_origin():
+    # Regression guard: DELETE /investigations/{id} is only reachable from a real
+    # browser if CORSMiddleware's allow_methods includes DELETE -- without it, the
+    # browser's own preflight is rejected and the actual DELETE is never sent,
+    # regardless of how the route itself authenticates/authorizes the request.
+    response = client.options(
+        "/investigations/1",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "DELETE",
+            "Access-Control-Request-Headers": "x-csrf-token",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == "http://localhost:5173"
+    allowed_methods = {m.strip() for m in response.headers.get("access-control-allow-methods", "").split(",")}
+    assert "DELETE" in allowed_methods
+
+
+def test_cors_preflight_for_delete_still_rejects_disallowed_origin():
+    response = client.options(
+        "/investigations/1",
+        headers={
+            "Origin": "http://evil.example.com",
+            "Access-Control-Request-Method": "DELETE",
+            "Access-Control-Request-Headers": "x-csrf-token",
+        },
+    )
+    assert "access-control-allow-origin" not in {h.lower() for h in response.headers}
+
+
 def test_security_headers_do_not_break_existing_functionality():
     response = client.get("/threats")
     assert response.status_code == 200
