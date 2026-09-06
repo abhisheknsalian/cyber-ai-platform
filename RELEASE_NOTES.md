@@ -5,18 +5,27 @@ history. This describes the state of the repository at the end of its final engi
 
 ## Frontend
 
-React (Vite + TypeScript + Tailwind) single-page dashboard: login-gated routing, a threat-analysis
-query page, a network-traffic classification page, a threat-intelligence graph view, and an about
-page. Talks to the backend directly (cross-origin, credentialed requests), not through a proxy.
-Served in production by an nginx container built from the static `vite build` output.
+React (Vite + TypeScript + Tailwind) single-page dashboard, gated behind a Login page (with a
+Register page for creating a new account): a Dashboard (live backend/RAG/LLM/classifier status), a
+Network Detection page (classify a CICFlowMeter-style flow, optionally run AI analysis, save the
+result to an investigation), a Threat Analysis query page, a Threat Intelligence page, an
+Investigations page (a registered account's saved investigation history — reopen or permanently
+delete an investigation, with a confirmation dialog before deleting), and an About page. Talks to
+the backend directly (cross-origin, credentialed requests), not through a proxy. Served in
+production by an nginx container built from the static `vite build` output.
 
 ## Backend API
 
-FastAPI service exposing 14 endpoints across three groups: public (`/`, `/health`, `/ready`,
-`/threats`, `/intelligence/entities`, `/intelligence/graph/{threat_id}`), authentication
-(`/auth/login`, `/auth/logout`, `/auth/me`), and protected (`/analyze`, `/classify`,
-`/ml/feature-importance`, `/analyze/classification`, `/intelligence/search`). See README **Backend
-Endpoints** and **Authentication** for the exact, current, verified list.
+FastAPI service exposing 22 endpoints across three groups: public (`/`, `/health`, `/ready`,
+`/metrics`, `/threats`, `/intelligence/entities`, `/intelligence/graph/{threat_id}`), authentication
+(`/auth/register`, `/auth/login`, `/auth/logout`, `/auth/me`), and protected (`/analyze`,
+`/classify`, `/ml/feature-importance`, `/analyze/classification`, `/intelligence/search`, and the
+`/investigations` family: `POST /investigations`, `GET /investigations`, `GET
+/investigations/{id}`, `POST /investigations/{id}/classification-results`, `POST
+/investigations/{id}/classification-results/{id}/analysis-result`, and `DELETE
+/investigations/{investigation_id}` — create/list/view/delete a persistent investigation and persist
+an already-computed classification/analysis result into one). See README **Backend Endpoints** and
+**Authentication** for the exact, current, verified list.
 
 ## ML detection
 
@@ -59,8 +68,11 @@ latency. Never trains, retrains, or modifies the production model or dataset. Se
 
 API-key and browser-session (HttpOnly cookie + CSRF double-submit) authentication, an explicit CORS
 allowlist, IP-keyed rate limiting, request-ID correlation, structured JSON logging, and standard
-security response headers. See README **Security Checklist** for the consolidated, section-linked
-status of every control.
+security response headers. Persistent investigations are session-user-only (never available to
+API-key callers or the demo/bootstrap login) and every read/write is scoped to the requesting
+user's own account directly in the database query — a nonexistent investigation and one owned by a
+different user are both a `404`, never a data leak. See README **Security Checklist** for the
+consolidated, section-linked status of every control.
 
 ## Deployment architecture
 

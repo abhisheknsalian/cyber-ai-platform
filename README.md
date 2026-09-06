@@ -74,8 +74,19 @@ caveat in detail.
 
 ## Screenshots
 
-Real captures from a local run against the real backend, real trained classifier, and real Ollama
-model — not mockups.
+Real captures from a local run against the real backend, real trained classifier, real Ollama
+model, and a real registered account — not mockups, and not the demo/bootstrap session.
+
+**Dashboard** — live backend/RAG/LLM/classifier status for the signed-in account, plus that
+account's most recent saved investigation:
+
+![Dashboard page showing live API, RAG engine, vector store, LLM, and ML engine status, plus a Recent Investigation card for a BENIGN result](docs/screenshots/dashboard.jpg)
+
+**Network Detection** — a real CICIDS2017 DDoS flow, classified by the Random Forest model, with
+the full Investigation Timeline (classification → RAG retrieval → threat graph → LLM analysis →
+threat report) already complete:
+
+![Network Detection page showing a DDoS classification at 100% confidence and a completed Investigation Timeline](docs/screenshots/network-detection.jpg)
 
 **Threat Analysis** — a real `/analyze` query ("How can DDoS attacks be mitigated?"), showing the
 deterministic MITRE ATT&CK technique, graph-derived mitigations, and source attribution alongside
@@ -83,15 +94,24 @@ the LLM-generated narrative:
 
 ![Threat Analysis page showing a DDoS attack analysis with severity, MITRE ATT&CK technique T1498, indicators, mitigations, and source attribution](docs/screenshots/threat-analysis.jpg)
 
-**Network Detection** — the Random Forest classifier scoring a CICFlowMeter-style feature vector
-(the all-zero example shape, not real captured traffic):
-
-![Network Detection page showing a BENIGN classification result with 84% probability from the random_forest model](docs/screenshots/network-detection.jpg)
-
 **Threat Intelligence graph** — the deterministic, one-hop relationship graph for one threat entity,
 rendered as a radial node-link diagram (plain SVG, no charting library):
 
 ![Threat Intelligence graph view showing the DDoS Attack entity with its technique, indicator, mitigation, and source relationships](docs/screenshots/threat-intelligence-graph.png)
+
+**Investigations** — a registered account's saved investigation history, most-recently-updated
+first, each with a Delete action:
+
+![Investigations page showing two saved investigations, one BENIGN and one malicious DDoS](docs/screenshots/investigations.jpg)
+
+**Investigation detail** — reopening a saved investigation shows its classification result and its
+full AI threat analysis together:
+
+![Investigation detail page showing a saved DDoS classification alongside its full AI threat analysis, MITRE technique, and intelligence sources](docs/screenshots/investigation-detail.jpg)
+
+**Delete confirmation** — deleting an investigation always asks first:
+
+![Delete confirmation dialog for a saved investigation, warning that the action is permanent](docs/screenshots/delete-confirmation.jpg)
 
 ## Architecture
 
