@@ -65,6 +65,19 @@ export function AboutPage() {
       </div>
 
       <Card className="mt-6 p-6">
+        <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-muted">Accounts &amp; investigations</h2>
+        <p className="text-sm leading-relaxed text-text-muted">
+          Creating an account gives you a persistent investigation history: save a Network Detection
+          classification -- and its AI threat analysis, if you run one -- to an investigation, then
+          reopen it later from the Investigations page. You can also permanently delete an
+          investigation you no longer need. Every investigation is scoped to the account that created
+          it server-side, so one account can never see, reopen, or delete another's investigations.
+          The demo/bootstrap login and direct API-key access do not get this persistence -- neither
+          can create, save to, or read investigations, by design.
+        </p>
+      </Card>
+
+      <Card className="mt-6 p-6">
         <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-muted">What this is not</h2>
         <p className="text-sm leading-relaxed text-text-muted">
           This is a local-first cybersecurity research/prototype platform, protected by session-based

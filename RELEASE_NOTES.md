@@ -80,10 +80,13 @@ real dataset, model, or Ollama instance.
 
 ## Testing
 
-285 automated backend tests (pytest) covering the RAG pipeline, ML pipeline, authentication,
-intelligence/graph endpoints, evaluation layer, deployment configuration, and the classifier-evidence
-integrity guarantees described above. No automated frontend browser test suite — the frontend was
-verified manually against the real backend and Ollama.
+479 automated backend tests (pytest) covering the RAG pipeline, ML pipeline, authentication,
+persistent per-user investigations (create/list/detail/delete, ownership isolation), intelligence/graph
+endpoints, evaluation layer, deployment configuration, and the classifier-evidence integrity
+guarantees described above. No automated frontend browser test suite — the frontend was verified
+manually against the real backend and Ollama, including a live end-to-end acceptance pass covering
+registration, login, classification, AI analysis, investigation save/reopen/delete, and cross-user
+isolation.
 
 ## Known scope boundaries
 

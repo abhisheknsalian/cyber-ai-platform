@@ -1,7 +1,7 @@
 [project]
 name = "cyber-ai-platform"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI-powered cyber threat intelligence platform for network detection, threat analysis, and persistent investigations."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

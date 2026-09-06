@@ -74,6 +74,11 @@ services:
       # mounting this :ro breaks every /analyze request with "attempt to write a
       # readonly database".
       - ./rag/chroma_db:/app/rag/chroma_db
+      # Persists the sentence-transformers embedding-model download (HF_HOME, see
+      # Dockerfile) across container restarts/recreations -- without this, a fresh
+      # container re-downloads it from huggingface.co on first use every time,
+      # matching docker-compose.prod.yml's hf_cache volume.
+      - hf_cache:/app/.cache/huggingface
     extra_hosts:
       # Docker Desktop (macOS/Windows) provides host.docker.internal automatically;
       # this makes the same OLLAMA_HOST default also work on Linux.
@@ -120,3 +125,7 @@ volumes:
   # Compose project -- `docker volume ls` shows it as
   # <project>_cyber_ai_postgres_data, distinct from any unrelated project's volumes.
   cyber_ai_postgres_data:
+  # Persists the sentence-transformers embedding-model download across container
+  # restarts/recreations -- without this, a fresh container re-downloads it from
+  # huggingface.co on first use every time (same tradeoff as docker-compose.prod.yml).
+  hf_cache:

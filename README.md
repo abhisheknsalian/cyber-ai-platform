@@ -31,7 +31,7 @@ Intelligence Graph** > "Hybrid retrieval").
 **3. Evaluation and engineering rigor.** A dedicated, read-only evaluation layer produces held-out
 (not just full-dataset) classification metrics, threshold and calibration analysis, and a retrieval
 sanity benchmark — all reproducible on demand and never presented as more than they are (see **Key
-Results** below and **Evaluation & Benchmarking**). 285 automated backend tests cover this pipeline
+Results** below and **Evaluation & Benchmarking**). 479 automated backend tests cover this pipeline
 end to end, including a real CI-only regression that was diagnosed, root-caused, and fixed (see
 **Testing**).
 
@@ -47,7 +47,7 @@ the full-precision values in **Evaluation & Benchmarking** below, which is the c
 | Macro F1 | 99.991% |
 | ROC-AUC | 0.99999985 |
 | PR-AUC | 0.99999988 |
-| Automated backend tests | 285 |
+| Automated backend tests | 479 |
 | Threat graph | 60 entities / 55 relationships |
 | LLM analysis latency | ~2.6–2.7s |
 
@@ -67,6 +67,7 @@ caveat in detail.
 | Hybrid retrieval | Combines vector and graph evidence into one typed, evidence-first LLM context (see **Threat Intelligence Graph** > "Hybrid retrieval") |
 | Evidence integrity | The LLM's own output schema has no field for prediction/probability/MITRE ID/source — structurally, not just by prompt instruction, it cannot override them (see **Classifier integration**) |
 | Authentication | API-key + browser session (HttpOnly cookie + CSRF double-submit) with persistent, multi-user accounts (argon2id-hashed passwords, SQLAlchemy + Alembic) behind registration/login, both fail closed (see **Authentication**, **Database Architecture**) |
+| Persistent investigations | Registered users can create an investigation, save a classification result and its AI analysis to it, reopen it later from a per-account history list, and permanently delete it; every read/write is scoped to the requesting user's own `user_id` server-side, so one user can never see, modify, or delete another's investigations (404, not a data leak, for both a nonexistent and a foreign id) — see **Database Architecture** > "User-specific investigations" |
 | Operational hardening | Rate limiting, request IDs, structured JSON logging, security headers, health/readiness separation (see **Observability & Operations**) |
 | Evaluation | Reproducible held-out/full-dataset metrics, threshold and calibration analysis, retrieval coverage benchmark, per-stage pipeline latency (see **Evaluation & Benchmarking**) |
 | Deployment architecture | Hardened Docker images, a production Compose profile, and a documented (not deployed) single-VM + reverse-proxy architecture (see **Production Deployment Architecture**) |
@@ -104,11 +105,13 @@ flowchart LR
         Classify["POST /classify<br/>Random Forest"]
         Analyze["POST /analyze<br/>POST /analyze/classification"]
         Search["POST /intelligence/search"]
+        Investigations["POST/GET/DELETE /investigations<br/>ownership-scoped, registered users only"]
     end
 
     Vector[("Chroma vector store<br/>sentence-transformers")]
     Graph[("Threat graph<br/>deterministic, in-memory")]
     LLM["Ollama<br/>Llama 3.2"]
+    DB[("PostgreSQL / SQLite<br/>users, investigations")]
 
     UI -->|cross-origin, credentialed| API
     Classify -->|"BENIGN / DDoS + probability"| Analyze
@@ -120,6 +123,10 @@ flowchart LR
     Graph -->|"indicators, mitigations, classifier evidence<br/>(labeled, LLM cannot override)"| LLM
     LLM -->|"narrative fields only<br/>(severity, summary, attack_vectors)"| Analyze
     Analyze -->|"validated Pydantic response"| UI
+    Classify -.->|"Save Investigation"| Investigations
+    Analyze -.->|"Save Investigation"| Investigations
+    Auth --> DB
+    Investigations --> DB
 
     classDef det fill:#0891b2,stroke:#0e7490,color:#fff
     classDef llm fill:#dc2626,stroke:#991b1b,color:#fff
@@ -132,7 +139,9 @@ fact that ends up in a response. The LLM (red) contributes only narrative fields
 field to smuggle a fact into (see **Threat Intelligence Graph** > "Evidence-first LLM"). Out-of-domain
 or unsupported queries never reach the LLM at all: if nothing in the knowledge base is actually
 relevant, the API returns a `no_relevant_intelligence` result directly from the retrieval layer. See
-**Relevance Filtering** below.
+**Relevance Filtering** below. A registered user can explicitly save a classification (and its AI
+analysis, if run) to a persistent investigation, scoped to their own account — see **Key
+Capabilities** > "Persistent investigations" and **Database Architecture** below.
 
 For the deployment-level view (containers, networks, trust boundaries, what's public vs. private),
 see **Production Deployment Architecture** > "Architecture diagram" further down.
@@ -175,8 +184,8 @@ open http://localhost:5173
 ```
 
 **What works immediately from a fresh clone:** the full RAG pipeline (Threat Analysis, Threat
-Intelligence), login/session auth, and all 285 automated tests (`uv run pytest tests/ -v`) — none of
-these need the trained classifier or the real dataset.
+Intelligence), login/session auth, persistent investigations, and all 479 automated tests (`uv run
+pytest tests/ -v`) — none of these need the trained classifier or the real dataset.
 
 **9. Optional — the DDoS classifier.** `POST /classify` and the Network Detection page return `503`
 until a model is trained, because **neither the trained model nor the real dataset is committed to
@@ -272,6 +281,7 @@ accumulates stale or duplicate chunks.
 - `POST /auth/login`, `POST /auth/logout`, `GET /auth/me` — see **Authentication** below (login is rate-limited; all three are public — session/API-key auth is what they exist to provide, not what protects them)
 - `POST /investigations`, `GET /investigations`, `GET /investigations/{id}` — create/list/view persistent per-user investigations (Phase 14; see **Database Architecture** > "User-specific investigations") (session-user-only, never API-key or demo)
 - `POST /investigations/{id}/classification-results`, `POST /investigations/{id}/classification-results/{id}/analysis-result` — persist an already-computed `/classify`/`/analyze/classification` result into an investigation; never re-run inference (Phase 14) (session-user-only)
+- `DELETE /investigations/{investigation_id}` — permanently deletes an investigation and its classification/analysis history (`204 No Content`); cascades at both the ORM and database level; 404 for both a nonexistent id and one owned by someone else (session-user-only, never API-key or demo)
 
 `GET /health` response (unchanged since Phase 6):
 
@@ -836,12 +846,23 @@ hand-built with Tailwind.
   result renders a distinct "no threat detected" state instead of a fabricated report.
 - **Threat Intelligence** (`/intelligence`) — the threat categories from `GET /threats`, i.e.
   exactly what's in `data/threat_intel/`.
-- **About** (`/about`) — architecture explanation; states plainly what is and isn't implemented.
+- **Investigations** (`/investigations`, Phase 14) — a registered user's saved investigation
+  history: a list (paginated, most-recently-updated first) of every investigation they've saved,
+  each showing its latest classification; opening one shows the full detail (every classification
+  result and its analysis, oldest to newest). Each investigation has a Delete action that shows a
+  confirmation dialog before permanently deleting it and its analysis history — see **Database
+  Architecture** > "User-specific investigations". Demo sessions and unauthenticated visitors see an
+  explanatory message instead of the list (persistence requires a registered account).
+- **About** (`/about`) — architecture explanation; states plainly what is and isn't implemented,
+  including the account/persistence model.
 - **Login** (`/login`, and the default for any unmatched path while unauthenticated) — shown
   instead of the app for an unauthenticated session (see **Authentication**). `AuthProvider`/
-  `useAuth` (`frontend/src/context/AuthContext.tsx`) call `GET /auth/me` on startup, gate all five
+  `useAuth` (`frontend/src/context/AuthContext.tsx`) call `GET /auth/me` on startup, gate all six
   pages above behind `authenticated`, and drop back to the login page automatically if any request
-  ever comes back `401`. The sidebar's "Log out" button calls `POST /auth/logout`.
+  ever comes back `401`. On successful login, the page navigates to `/` immediately (rather than
+  relying on the authenticated route table to already match whatever URL the login form happened to
+  be submitted from) so the Dashboard renders right away instead of a blank shell. The sidebar's
+  "Log out" button calls `POST /auth/logout`.
 - **Register** (`/register`, Phase 13) — username/password form (loading, error, and success
   states) that calls `POST /auth/register`; on success, redirects to `/login` after a brief
   confirmation rather than logging the user in automatically, matching the registration flow in
@@ -859,7 +880,10 @@ defaulting to `http://localhost:8000` if unset. Never commit `frontend/.env`.
 
 **CORS**: the backend explicitly allows only `http://localhost:5173` (the Vite dev server), with
 `allow_credentials=True` so the session/CSRF cookies can be sent — never a wildcard origin, which
-is a hard requirement for combining CORS with credentials in the first place.
+is a hard requirement for combining CORS with credentials in the first place. `allow_methods`
+explicitly lists `GET`, `POST`, and `DELETE` (the last one for deleting an investigation) — a method
+missing from this list fails the browser's own CORS preflight before the request is ever sent,
+independent of how the route itself authenticates or authorizes it.
 
 ## Configuration
 
@@ -2216,7 +2240,7 @@ correct — nothing more. Three independent jobs:
 
 | Job | Steps | Validates |
 |---|---|---|
-| `backend-tests` | checkout → `astral-sh/setup-uv` → `uv sync --frozen` → `uv run pytest tests/ -v` | The backend test suite (currently 285 tests) |
+| `backend-tests` | checkout → `astral-sh/setup-uv` → `uv sync --frozen` → `uv run pytest tests/ -v` | The backend test suite (currently 479 tests) |
 | `frontend-quality` | checkout → `actions/setup-node` (Node 22) → `npm ci` → `npm run lint` → `npm run build` | The frontend lints and builds cleanly |
 | `docker-build` | checkout → `docker build -t cyber-ai-backend .` → `docker build -t cyber-ai-frontend ./frontend` | Both images are reproducibly buildable from tracked source |
 
@@ -2322,13 +2346,24 @@ Covered:
   rest of this suite, no Ollama required) and structurally proves a hostile mocked LLM fragment
   cannot leak into the JSON report, which has no field for arbitrary LLM text; the CLI's default
   (no `--pipeline`) invocation is asserted to never call the LLM at all
+- **Phase 14 (persistent investigations):** create/list/detail/delete all use the same
+  ownership-scoped query pattern (`user_id` in the lookup itself, never fetched then compared) —
+  covered for the owning user, a different registered user (404, not 403, so a nonexistent id and a
+  foreign id are indistinguishable), an unauthenticated caller, an API-key-only caller, and the demo
+  session, all of which are rejected before ownership is even checked; deleting an investigation is
+  verified to cascade to its classification/analysis results (both at the SQLAlchemy ORM level and
+  via the database's own `ON DELETE CASCADE`) without touching a sibling investigation or another
+  user's data; a CORS regression test asserts the browser preflight for `DELETE` succeeds from the
+  configured frontend origin and is still rejected from an arbitrary one
 
-Frontend automated tests were not added in this phase (no test runner existed for `frontend/`
-before it, and adding one — e.g. Vitest + Testing Library — is a separate infrastructure decision
-from browser auth integration). The login/logout/redirect flows were verified manually: open the
-app signed out, confirm the login page renders, sign in, confirm the app renders and the session
-cookie is `HttpOnly` (unreadable from the browser console), sign out, confirm the login page
-returns.
+Frontend automated tests were not added (no test runner existed for `frontend/`, and adding one —
+e.g. Vitest + Testing Library — is a separate infrastructure decision from this work). The full
+user journey was instead verified with a live, manual, real-backend browser pass: register, log in,
+classify real CICIDS2017 traffic, run AI analysis, save the investigation, reload the browser
+(confirming no duplicate save), open/delete a saved investigation (confirming the delete
+confirmation dialog, cancel, and the real `DELETE` request all behave correctly), and confirm a
+second registered user can see neither the first user's unsaved draft nor their investigation
+history.
 
 ## Evaluation & Benchmarking
 
@@ -2587,28 +2622,43 @@ backend/
         threat_analysis.py    # orchestrates retrieval -> MITRE extraction -> LLM -> response
         classification.py     # maps a classifier prediction -> the RAG pipeline above
         auth.py                # login credential validation (backend/sessions.py owns session storage)
-    security.py             # require_auth: API key OR session+CSRF, either satisfies protected routes
+        users.py                # Phase 13: registration -- argon2id hashing, uniqueness check
+        investigations.py        # Phase 14: ownership-scoped investigation persistence (create/list/detail/delete)
+    db/                      # Phase 13/14: SQLAlchemy models + session/engine setup
+        base.py                # declarative Base shared by every ORM model
+        models.py               # User, Investigation, ClassificationRecord, AnalysisRecord (+ cascade FKs)
+        session.py               # engine/session factory; SQLite PRAGMA foreign_keys=ON listener
+    investigations/            # Phase 14: request/response schemas for the /investigations endpoints
+        schemas.py
+    security.py             # require_auth: API key OR session+CSRF; require_user_id: session+CSRF only (investigations)
     sessions.py              # in-memory session store (backend/sessions.py) -- see Authentication
+alembic/                    # Phase 13/14: schema migrations for the users/investigations tables (see Database Architecture)
+    versions/                  # 0001_create_users_table.py, 0002_create_investigation_tables.py
 data/threat_intel/         # source threat-intelligence documents
 data/raw/                   # CICIDS2017 CSV goes here (gitignored, not committed)
 models/                      # trained classifier artifact + metadata (gitignored, not committed)
 rag/graph/                    # persisted threat_graph.json (gitignored, Phase 9 -- see Rebuilding the graph)
 evaluation/                    # generated reports (gitignored, Phase 11 -- see Evaluation & Benchmarking)
 notebooks/                 # exploratory notebooks (DDoS classifier, RAG pipeline walkthrough)
-tests/                      # pytest suite (RAG + ML + auth + intelligence + evaluation)
+tests/                      # pytest suite (RAG + ML + auth + investigations + intelligence + evaluation)
 frontend/
     src/
-        types/api.ts, ml.ts, auth.ts, intelligence.ts   # TypeScript types mirroring the backend Pydantic models
+        types/api.ts, ml.ts, auth.ts, intelligence.ts, investigations.ts   # TypeScript types mirroring the backend Pydantic models
         services/api.ts                 # the only fetch() call site; typed, error-normalized, sends cookies
-        context/AuthContext.tsx          # auth state; calls GET /auth/me on startup, listens for 401s
-        hooks/                            # useHealth, useThreats, useThreatGraph
+        context/AuthContext.tsx          # auth state; calls GET /auth/me on startup, listens for 401s; clears per-user client state on login/logout/401
+        store/                            # Phase 14: Zustand stores
+            networkDetectionStore.ts        # in-progress Network Detection draft (localStorage-persisted, per browser not per user)
+            investigationHistoryStore.ts     # fetched investigation list/detail + save/delete actions + the active-draft's save state (partially localStorage-persisted, reload-safe)
+            safeLocalStorage.ts               # shared defensive localStorage wrapper used by both stores above
+        hooks/                            # useHealth, useReadiness, useThreats, useThreatGraph
         components/
             layout/              # AppShell, Sidebar (incl. logout button)
-            common/               # Card, PageHeader, SeverityBadge, StatusPill
-            dashboard/            # StatCard
+            common/               # Card, PageHeader, SeverityBadge, StatusPill, StatusDot, ConfidenceBar, PipelineStages, ConfirmDialog (Phase 14 delete confirmation)
+            dashboard/            # StatCard, ArchitecturePipeline, RecentInvestigationCard
             analysis/             # QueryInput, SampleQueries, LoadingState, AnalysisResult, ...
+            detection/             # DetectionResultCard, JsonEditor -- Network Detection page
             intelligence/          # ThreatGraphView -- Phase 9 radial relationship diagram (plain SVG)
-        pages/                  # LoginPage, DashboardPage, ThreatAnalysisPage, NetworkDetectionPage, ThreatIntelligencePage, AboutPage
+        pages/                  # LoginPage, RegisterPage, DashboardPage, ThreatAnalysisPage, NetworkDetectionPage, InvestigationsPage, ThreatIntelligencePage, AboutPage
         App.tsx                 # router + auth gate
     public/config.js            # local-dev runtime-config fallback (window.__APP_CONFIG__ = {})
     config.template.js          # Docker-only: envsubst template for the same config.js
@@ -2618,13 +2668,15 @@ frontend/
     .dockerignore
 Dockerfile                      # backend image (see Docker Backend)
 .dockerignore
-docker-compose.yml               # wires the backend + frontend images together (see Docker Compose)
+docker-compose.yml               # wires the db + backend + frontend images together (see Docker Compose)
 docker-compose.prod.yml           # additive production Compose profile (see Production Deployment Architecture)
 .env.example                     # placeholder values for docker-compose.yml (copy to .env, gitignored)
 .env.prod.example                 # placeholder values for docker-compose.prod.yml (copy to .env.prod, gitignored)
 deploy/nginx/                      # example reverse-proxy config (not wired into any Compose file -- see TLS / Ingress)
 RELEASE_NOTES.md                    # capability summary by subsystem, not a commit log
 docs/screenshots/                    # real screenshots referenced above
+docs/THESIS_EVALUATION.md            # academic/thesis evaluation writeup -- documentation only, not part of the running application
+docs/LLM_RUBRIC_ANNOTATION_GUIDE.md  # academic/thesis human-rubric annotation guide -- documentation only, not part of the running application
 ```
 
 ## Final Limitations Summary
